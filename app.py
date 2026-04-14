@@ -75,7 +75,7 @@ def process_uploaded_pdfs(files):
     with st.spinner("正在处理文档，首次加载模型可能需要 1-2 分钟…"):
         embeddings = get_embeddings()
         vectorstore = None
-        if os.path.exists(VECTORSTORE_DIR):
+        if os.path.exists(VECTORSTORE_DIR) and any(os.scandir(VECTORSTORE_DIR)):
             from langchain_community.vectorstores import Chroma as _C
             vectorstore = _C(
                 persist_directory=VECTORSTORE_DIR,
