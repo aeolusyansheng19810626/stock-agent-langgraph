@@ -43,21 +43,24 @@ stock-agent/
 │   ├── skill_search_web.md
 │   └── skill_send_email.md
 ├── charts/             # 走势图输出目录（运行时自动生成）
+├── .env                # API Keys（不上传 git，参考 .env.example）
 ├── token.pickle        # Gmail OAuth 凭证（不上传 git）
 └── requirements.txt
 ```
 
 ---
 
-## API Keys（硬编码在文件顶部）
+## API Keys
 
-| Key | 文件 | 变量名 |
-|-----|------|--------|
-| Groq | `app.py` / `main.py` | `GROQ_API_KEY` |
-| Gemini | `app.py` / `main.py` | `GEMINI_API_KEY` |
-| Tavily | `tools.py` | `TAVILY_API_KEY` |
+所有 key 存放在项目根目录的 `.env` 文件中（不上传 git）。
 
-支持环境变量覆盖：设置 `GROQ_API_KEY` / `GEMINI_API_KEY` 环境变量后，硬编码值不生效。
+```
+GROQ_API_KEY=your_groq_api_key
+GEMINI_API_KEY=your_gemini_api_key
+TAVILY_API_KEY=your_tavily_api_key
+```
+
+换机器时，参考 `.env.example` 创建 `.env` 并填入对应的 key。
 
 ---
 
