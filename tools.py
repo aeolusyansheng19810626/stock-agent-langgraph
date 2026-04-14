@@ -9,6 +9,21 @@ from tavily import TavilyClient
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 
+VECTORSTORE_DIR = "./vectorstore"
+_embeddings = None
+
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+        except ImportError:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+        _embeddings = HuggingFaceEmbeddings(
+            model_name="paraphrase-multilingual-MiniLM-L12-v2"
+        )
+    return _embeddings
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -80,6 +95,32 @@ def get_stock_history(ticker: str, period: str = "6mo") -> str:
         "change_pct": round((hist["Close"].iloc[-1] - hist["Close"].iloc[0]) / hist["Close"].iloc[0] * 100, 2)
     }
     return json.dumps(summary)
+
+@tool
+def search_documents(query: str) -> str:
+    """从已上传的财报PDF中检索相关内容。当用户询问具体财务数据、
+    营收、利润、季报、年报等信息时优先使用此工具。
+    如果返回内容为空，说明没有上传相关文档。"""
+    if not os.path.exists(VECTORSTORE_DIR):
+        return "暂无上传文档，请先在侧边栏上传财报 PDF。"
+    try:
+        from langchain_community.vectorstores import Chroma
+        embeddings = get_embeddings()
+        vectorstore = Chroma(
+            persist_directory=VECTORSTORE_DIR,
+            embedding_function=embeddings,
+            collection_name="stockai_docs",
+        )
+        docs = vectorstore.similarity_search(query, k=3)
+        if not docs:
+            return "文档库中未找到相关内容。"
+        results = []
+        for i, doc in enumerate(docs):
+            source = doc.metadata.get("source", "未知文件")
+            results.append(f"[片段 {i+1} · 来源: {source}]\n{doc.page_content}")
+        return "\n\n".join(results)
+    except Exception as e:
+        return f"文档检索失败：{e}"
 
 @tool
 def send_email_report(to: str, subject: str, body: str) -> str:

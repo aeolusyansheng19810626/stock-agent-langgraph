@@ -6,3 +6,4 @@ charts/
 *.json
 .env
 token.pickle
+vectorstore/

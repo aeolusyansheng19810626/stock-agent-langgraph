@@ -2,7 +2,7 @@ import os
 import glob
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from tools import get_stock_data, search_web, get_stock_history, send_email_report
+from tools import get_stock_data, search_web, get_stock_history, send_email_report, search_documents
 
 # ====== API Keys ======
 from dotenv import load_dotenv
@@ -25,6 +25,7 @@ skill_content = load_skills("skills")
 system_prompt = f"""你是一个专业的股票分析师，拥有10年股市投资经验。
 
 重要规则：
+- 如果用户询问具体财务数据、营收、利润、季报、年报等，先调用 search_documents，有结果则优先使用，没有结果再用 search_web 搜索
 - 涉及任何新闻、近期动态、最新消息、近期走势时，必须先调用 search_web 工具
 - 禁止用训练数据回答新闻类问题，训练数据已过时
 - 搜索关键词用英文，回答用中文
@@ -58,13 +59,59 @@ def extract_text(content) -> str:
         return "".join(parts)
     return str(content)
 
+# ====== 处理上传 PDF，写入向量库 ======
+def process_uploaded_pdfs(files):
+    import tempfile
+    from langchain_community.document_loaders import PyPDFLoader
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_community.vectorstores import Chroma
+    from tools import get_embeddings, VECTORSTORE_DIR
+
+    new_files = [f for f in files if f.name not in st.session_state.processed_docs]
+    if not new_files:
+        return
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    with st.spinner("正在处理文档，首次加载模型可能需要 1-2 分钟…"):
+        embeddings = get_embeddings()
+        vectorstore = None
+        if os.path.exists(VECTORSTORE_DIR):
+            from langchain_community.vectorstores import Chroma as _C
+            vectorstore = _C(
+                persist_directory=VECTORSTORE_DIR,
+                embedding_function=embeddings,
+                collection_name="stockai_docs",
+            )
+
+        for file in new_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file.read())
+                tmp_path = tmp.name
+            try:
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load()
+                chunks = splitter.split_documents(docs)
+                for chunk in chunks:
+                    chunk.metadata["source"] = file.name
+                if vectorstore is None:
+                    vectorstore = Chroma.from_documents(
+                        chunks, embeddings,
+                        persist_directory=VECTORSTORE_DIR,
+                        collection_name="stockai_docs",
+                    )
+                else:
+                    vectorstore.add_documents(chunks)
+                st.session_state.processed_docs[file.name] = len(chunks)
+            finally:
+                os.unlink(tmp_path)
+
 # ====== 初始化 LLM 和工具（按模型缓存） ======
 @st.cache_resource
 def init_agents():
     from langchain_groq import ChatGroq
     from langchain_google_genai import ChatGoogleGenerativeAI
 
-    tools = [get_stock_data, search_web, get_stock_history, send_email_report]
+    tools = [get_stock_data, search_web, get_stock_history, send_email_report, search_documents]
     tools_map = {t.name: t for t in tools}
 
     groq_llm = ChatGroq(
@@ -715,6 +762,10 @@ if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
 if "gemini_exhausted" not in st.session_state:
     st.session_state.gemini_exhausted = False
+if "dev_mode" not in st.session_state:
+    st.session_state.dev_mode = False
+if "processed_docs" not in st.session_state:
+    st.session_state.processed_docs = {}  # filename -> chunk_count
 
 # ====== 侧边栏 ======
 with st.sidebar:
@@ -755,15 +806,48 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section"><div class="sidebar-section-title">操作</div></div>',
                 unsafe_allow_html=True)
 
+    dev_mode = st.toggle("🛠️ 开发模式（仅 Groq）", value=st.session_state.dev_mode)
+    if dev_mode != st.session_state.dev_mode:
+        st.session_state.dev_mode = dev_mode
+        st.rerun()
+
     if st.button("🗑️ 清空对话记录", use_container_width=True):
         st.session_state.messages = []
         st.session_state.chat_history = []
         st.rerun()
 
-    gemini_label = "🔴 Gemini 已耗尽（点击恢复）" if st.session_state.gemini_exhausted else "✅ Gemini 正常"
-    if st.button(gemini_label, use_container_width=True, disabled=not st.session_state.gemini_exhausted):
-        st.session_state.gemini_exhausted = False
-        st.rerun()
+    if not st.session_state.dev_mode:
+        gemini_label = "🔴 Gemini 已耗尽（点击恢复）" if st.session_state.gemini_exhausted else "✅ Gemini 正常"
+        if st.button(gemini_label, use_container_width=True, disabled=not st.session_state.gemini_exhausted):
+            st.session_state.gemini_exhausted = False
+            st.rerun()
+
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section"><div class="sidebar-section-title">📄 财报文档</div></div>',
+                unsafe_allow_html=True)
+
+    uploaded_files = st.file_uploader(
+        "上传 PDF 财报",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="pdf_uploader",
+        label_visibility="collapsed",
+    )
+    if uploaded_files:
+        process_uploaded_pdfs(uploaded_files)
+
+    if st.session_state.processed_docs:
+        for fname, cnt in st.session_state.processed_docs.items():
+            st.markdown(
+                f'<div style="font-size:0.75rem;color:#6B7280;padding:2px 4px;">'
+                f'✅ {fname} <span style="color:#9CA3AF">({cnt} 片段)</span></div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            '<div style="font-size:0.75rem;color:#9CA3AF;padding:2px 4px;">暂无文档，上传后可查询财报数据</div>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown("""
     <div class="sidebar-disclaimer">
@@ -831,7 +915,8 @@ for msg in st.session_state.messages:
     elif role == "assistant":
         with st.chat_message("assistant"):
             st.markdown(msg["content"])
-            st.caption("⚠️ 以上内容仅供参考，不构成投资建议。")
+            model_label = f"　　由 {msg['model']} 生成" if msg.get("model") else ""
+            st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。{model_label}")
     elif role == "tool":
         st.markdown(f"""
         <div class="tool-call-block">
@@ -925,15 +1010,18 @@ if user_input:
             messages = [SystemMessage(content=system_prompt)] + st.session_state.chat_history
             final_response = None
 
-            if st.session_state.gemini_exhausted:
-                # 已知日配额耗尽，直接走 Groq
+            final_model = None
+            if st.session_state.dev_mode or st.session_state.gemini_exhausted:
+                # 开发模式或日配额耗尽，直接走 Groq
                 fallback_response = groq_with_tools.invoke(messages)
                 final_response = extract_text(fallback_response.content)
+                final_model = "Groq"
             else:
                 for attempt in range(2):  # 最多重试1次
                     try:
                         final_response_obj = gemini_with_tools.invoke(messages)
                         final_response = extract_text(final_response_obj.content)
+                        final_model = "Gemini"
                         break
                     except ChatGoogleGenerativeAIError as e:
                         err = str(e)
@@ -950,17 +1038,19 @@ if user_input:
                             st.warning("Gemini 日配额已用完，已切换至 Groq 模式（下午 4 点后点击侧边栏按钮恢复）")
                             fallback_response = groq_with_tools.invoke(messages)
                             final_response = extract_text(fallback_response.content)
+                            final_model = "Groq"
                             break
             # 兜底：Gemini 返回空内容时降级到 Groq
             if not final_response or not final_response.strip():
                 fallback_response = groq_with_tools.invoke(messages)
                 final_response = extract_text(fallback_response.content)
+                final_model = "Groq"
 
             st.session_state.chat_history.append(AIMessage(content=final_response))
             with st.chat_message("assistant"):
                 st.markdown(final_response)
-                st.caption("⚠️ 以上内容仅供参考，不构成投资建议。")
-            st.session_state.messages.append({"role": "assistant", "content": final_response})
+                st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。　　由 {final_model} 生成")
+            st.session_state.messages.append({"role": "assistant", "content": final_response, "model": final_model})
             break
 
     # ====== 显示本次新生成的走势图 ======
