@@ -1,8 +1,10 @@
 import json
 import pickle
 import os
-import yfinance as yf
+import matplotlib
+matplotlib.use('Agg')  # 强制非交互后端，避免 Windows 上 GUI 线程阻塞
 import matplotlib.pyplot as plt
+import yfinance as yf
 from langchain_core.tools import tool
 from datetime import datetime
 from tavily import TavilyClient
