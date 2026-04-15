@@ -1005,9 +1005,7 @@ if typed:
     user_input = typed
 
 if user_input:
-    print(f"[DEBUG] user_input received: {user_input[:50]}")
     groq_llm, groq_with_tools, gemini_with_tools, tools_map = init_agents()
-    print("[DEBUG] init_agents OK")
 
     with st.chat_message("user"):
         st.markdown(user_input)
@@ -1034,11 +1032,9 @@ if user_input:
             while step <= MAX_STEPS:
                 messages = [SystemMessage(content=system_prompt)] + st.session_state.chat_history
 
-                print(f"[DEBUG] calling groq, step={step}")
                 status_box.update(label=f"正在思考（第 {step} 步）…")
                 # 用 Groq 判断是否还需要调用工具
                 groq_response = groq_with_tools.invoke(messages)
-                print(f"[DEBUG] groq returned, tool_calls={bool(groq_response.tool_calls)}")
 
                 if groq_response.tool_calls:
                     st.session_state.chat_history.append(groq_response)
@@ -1059,9 +1055,7 @@ if user_input:
                             "content": "",
                         })
 
-                        print(f"[DEBUG] invoking tool: {tool_name} args={tool_args}")
                         result = tools_map[tool_name].invoke(tool_args)
-                        print(f"[DEBUG] tool {tool_name} done")
                         step += 1
 
                         st.session_state.chat_history.append(ToolMessage(

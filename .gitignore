@@ -7,3 +7,4 @@ charts/
 .env
 token.pickle
 vectorstore/
+token.pickle 
