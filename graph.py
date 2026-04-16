@@ -20,6 +20,41 @@ from tools import (
 )
 
 
+FAST_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+QUALITY_MODEL = "openai/gpt-oss-120b"
+
+# ── 各节点模型配置，在这里统一修改，无需改动节点代码 ──────────────────────────
+PARSE_MODEL       = FAST_MODEL     # parse_node:  分类 + 提取 JSON，快速模型足够
+DATA_AGENT_MODEL  = FAST_MODEL     # data_node:   技术面分析
+NEWS_AGENT_MODEL  = FAST_MODEL     # news_node:   新闻摘要
+RAG_AGENT_MODEL   = FAST_MODEL     # rag_node:    财报提取
+REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node: Groq 路径（dev_mode 主力 或 Gemini fallback）
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATA_AGENT_SYSTEM = """你是一个股票技术面分析助手。
+你会收到一支或多支股票的实时行情数据（价格、涨跌幅、PE、52周高低等）和可选的历史走势描述。
+请基于这些数据，输出一段简洁的技术面分析（100-200字），包含：
+- 当前估值水平（PE 是否偏高/偏低）
+- 价格位置（当前价格在 52 周区间的位置）
+- 近期趋势判断（如有历史数据）
+只基于提供的数据，不要编造内容，不要废话。"""
+
+NEWS_AGENT_SYSTEM = """你是一个财经新闻分析师。
+你会收到关于某支股票或公司的最新新闻搜索结果。
+请基于这些新闻，输出一段简洁的新闻摘要与市场情绪分析（100-200字），包含：
+- 关键事件或催化剂（如有）
+- 市场情绪判断（正面 / 负面 / 中性）
+- 对股价可能的短期影响
+只基于提供的新闻内容，不要编造，不要废话。"""
+
+RAG_AGENT_SYSTEM = """你是一个财报分析师。
+你会收到从上传财报 PDF 中检索出的相关段落。
+请基于这些内容，输出一段简洁的财务分析摘要（100-200字），提取：
+- 关键财务指标（营收、利润、EPS、毛利率等，如有）
+- 同比 / 环比变化趋势（如有）
+- 管理层指引或重要披露（如有）
+只基于提供的文档内容，不要编造数据，不要废话。"""
+
 PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，输出一个 JSON 调度计划。
 
 严格输出纯 JSON，不要 markdown 代码块，不要任何解释文字。
@@ -247,8 +282,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
 def parse_node(state: AgentState) -> dict:
     groq = ChatGroq(
         api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-        # model="meta-llama/llama-4-scout-17b-16e-instruct",
-        model="openai/gpt-oss-120b",
+        model=PARSE_MODEL,
     )
 
     history_ctx = state.get("chat_history_text", "")
@@ -307,14 +341,14 @@ def data_node(state: AgentState) -> dict:
     periods = state.get("periods") or ["6mo"] * len(tickers)
 
     tool_calls = []
-    results = []
+    raw_results = []
     errors = []
 
     for ticker in tickers:
         try:
             result = get_stock_data.invoke({"ticker": ticker})
             tool_calls.append({"tool_name": "get_stock_data", "tool_args": {"ticker": ticker}})
-            results.append(f"[Stock Data: {ticker}]\n{result}")
+            raw_results.append(f"[Stock Data: {ticker}]\n{result}")
         except Exception as exc:
             errors.append({
                 "node": "data_node",
@@ -332,7 +366,7 @@ def data_node(state: AgentState) -> dict:
                     "tool_name": "get_stock_history",
                     "tool_args": {"ticker": ticker, "period": period},
                 })
-                results.append(f"[Price History: {ticker} / {period}]\n{result}")
+                raw_results.append(f"[Price History: {ticker} / {period}]\n{result}")
             except Exception as exc:
                 errors.append({
                     "node": "data_node",
@@ -341,8 +375,33 @@ def data_node(state: AgentState) -> dict:
                     "retryable": True,
                 })
 
+    raw_text = "\n\n".join(raw_results)
+
+    # LLM post-reasoning: 对原始数据做技术面分析
+    analysis = raw_text  # 默认 fallback 为原始数据
+    if raw_text.strip():
+        try:
+            llm = ChatGroq(
+                api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+                model=DATA_AGENT_MODEL,
+            )
+            resp = llm.invoke([
+                SystemMessage(content=DATA_AGENT_SYSTEM),
+                HumanMessage(content=f"原始数据：\n{raw_text}"),
+            ])
+            analysis_text = _extract_text(resp.content).strip()
+            if analysis_text:
+                analysis = f"[技术面分析 by data_agent]\n{analysis_text}\n\n[原始数据]\n{raw_text}"
+        except Exception as exc:
+            errors.append({
+                "node": "data_node",
+                "tool": "llm_analysis",
+                "message": str(exc),
+                "retryable": False,
+            })
+
     return {
-        "stock_data": "\n\n".join(results),
+        "stock_data": analysis,
         "tool_calls": tool_calls,
         "errors": errors,
     }
@@ -356,13 +415,10 @@ def news_node(state: AgentState) -> dict:
     current_year = str(datetime.now().year)
     if current_year not in query:
         query = f"{query} {current_year}"
+
+    errors = []
     try:
-        result = search_web.invoke({"query": query})
-        return {
-            "news": f"[Web News]\n{result}",
-            "tool_calls": [{"tool_name": "search_web", "tool_args": {"query": query}}],
-            "errors": [],
-        }
+        raw_result = search_web.invoke({"query": query})
     except Exception as exc:
         return {
             "news": "",
@@ -375,19 +431,45 @@ def news_node(state: AgentState) -> dict:
             }],
         }
 
+    tool_calls = [{"tool_name": "search_web", "tool_args": {"query": query}}]
+
+    # LLM post-reasoning: 对新闻原文做摘要与情绪分析
+    analysis = f"[Web News]\n{raw_result}"  # 默认 fallback
+    try:
+        llm = ChatGroq(
+            api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            model=NEWS_AGENT_MODEL,
+        )
+        resp = llm.invoke([
+            SystemMessage(content=NEWS_AGENT_SYSTEM),
+            HumanMessage(content=f"新闻原文：\n{raw_result}"),
+        ])
+        analysis_text = _extract_text(resp.content).strip()
+        if analysis_text:
+            analysis = f"[新闻摘要 by news_agent]\n{analysis_text}\n\n[原始新闻]\n{raw_result}"
+    except Exception as exc:
+        errors.append({
+            "node": "news_node",
+            "tool": "llm_analysis",
+            "message": str(exc),
+            "retryable": False,
+        })
+
+    return {
+        "news": analysis,
+        "tool_calls": tool_calls,
+        "errors": errors,
+    }
+
 
 def rag_node(state: AgentState) -> dict:
     if not state.get("need_rag"):
         return {"rag_result": "", "tool_calls": [], "errors": []}
 
     query = state["rag_query"]
+    errors = []
     try:
-        result = search_documents.invoke({"query": query})
-        return {
-            "rag_result": f"[Document Retrieval]\n{result}",
-            "tool_calls": [{"tool_name": "search_documents", "tool_args": {"query": query}}],
-            "errors": [],
-        }
+        raw_result = search_documents.invoke({"query": query})
     except Exception as exc:
         return {
             "rag_result": "",
@@ -399,6 +481,36 @@ def rag_node(state: AgentState) -> dict:
                 "retryable": True,
             }],
         }
+
+    tool_calls = [{"tool_name": "search_documents", "tool_args": {"query": query}}]
+
+    # LLM post-reasoning: 从检索结果中提炼关键财务信息
+    analysis = f"[Document Retrieval]\n{raw_result}"  # 默认 fallback
+    try:
+        llm = ChatGroq(
+            api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            model=RAG_AGENT_MODEL,
+        )
+        resp = llm.invoke([
+            SystemMessage(content=RAG_AGENT_SYSTEM),
+            HumanMessage(content=f"检索到的财报段落：\n{raw_result}"),
+        ])
+        analysis_text = _extract_text(resp.content).strip()
+        if analysis_text:
+            analysis = f"[财报分析 by rag_agent]\n{analysis_text}\n\n[原始检索结果]\n{raw_result}"
+    except Exception as exc:
+        errors.append({
+            "node": "rag_node",
+            "tool": "llm_analysis",
+            "message": str(exc),
+            "retryable": False,
+        })
+
+    return {
+        "rag_result": analysis,
+        "tool_calls": tool_calls,
+        "errors": errors,
+    }
 
 
 def report_node(state: AgentState) -> dict:
@@ -440,8 +552,7 @@ def report_node(state: AgentState) -> dict:
     def call_groq() -> str:
         llm = ChatGroq(
             api_key=groq_api_key,
-            # model="meta-llama/llama-4-scout-17b-16e-instruct",
-            model="openai/gpt-oss-120b",
+            model=REPORT_GROQ_MODEL,
         )
         resp = llm.invoke(messages)
         return _extract_text(resp.content)
@@ -472,13 +583,15 @@ def report_node(state: AgentState) -> dict:
             else:
                 response = call_groq()
                 final_model = "Groq"
-        except ChatGoogleGenerativeAIError as exc:
+        except Exception as exc:
             err = str(exc)
-            if "429" not in err and "RESOURCE_EXHAUSTED" not in err:
+            # 以下情况 fallback 到 Groq：配额耗尽、限速、服务不可用
+            if any(k in err for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")):
+                response = call_groq()
+                final_model = "Groq"
+                new_gemini_exhausted = "RESOURCE_EXHAUSTED" in err
+            else:
                 raise
-            response = call_groq()
-            final_model = "Groq"
-            new_gemini_exhausted = "RESOURCE_EXHAUSTED" in err
 
         if response is None:
             response = call_groq()
