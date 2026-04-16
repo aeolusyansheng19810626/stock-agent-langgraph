@@ -16,22 +16,25 @@
 ---
 
 ### `graph.py` — AI 大脑（LangGraph 多 Agent 图）
-整个项目最核心的文件。定义了 5 个节点：
+整个项目最核心的文件。定义了 5 个节点，每个节点都是真正的 Agent：
 
 ```
-parse_node   → 理解用户问题，决定要调用哪些 agent
-data_node    → 获取股价和走势图（调用 yfinance）
-news_node    → 搜索最新新闻（调用 Tavily）
-rag_node     → 检索已上传的财报 PDF（调用 ChromaDB）
-report_node  → 汇总上面的数据，生成最终分析报告
+parse_node   → 理解用户问题，决定要调用哪些 agent（输出 JSON 调度计划）
+data_node    → 调用 yfinance 获取股价数据，再用 LLM 做技术面分析
+news_node    → 调用 Tavily 搜索新闻，再用 LLM 做摘要和情绪判断
+rag_node     → 调用 ChromaDB 检索财报，再用 LLM 提取关键财务指标
+report_node  → 汇总各 agent 的预分析结论，生成最终投资分析报告
 ```
 
 `parse_node` 执行完后，`data/news/rag` 三个节点**并行执行**，
 全部完成后 `report_node` 才开始生成报告。
 
-模型分工：
-- `parse_node` + `report_node(fallback)` → openai/gpt-oss-120b（via Groq）
-- `report_node(主力)` → Gemini 2.5 Flash（运行模式下）
+`report_node` 接收的不是原始数据，而是各 agent 已经预分析过的结论。
+
+模型分工（在文件顶部集中配置，改常量即可）：
+- `parse_node / data_node / news_node / rag_node` → LLaMA（快速模型，via Groq）
+- `report_node` 主力 → Gemini 2.5 Flash（运行模式）
+- `report_node` fallback → openai/gpt-oss-120b（via Groq）
 
 ---
 
@@ -97,11 +100,13 @@ TAVILY_API_KEY=...
   ↓
 app.py（接收输入）
   ↓
-graph.py → parse_node（规划）
+graph.py → parse_node（规划，输出 JSON 调度计划）
               ↓ 并行
-         data_node / news_node / rag_node
-              ↓ 汇总
-         report_node（生成报告）
+         data_node（yfinance → LLM 技术面分析）
+         news_node（Tavily   → LLM 新闻摘要）
+         rag_node （ChromaDB → LLM 财务提取）
+              ↓ 汇总预分析结论
+         report_node（生成最终报告）
   ↓
 app.py（显示报告 + 图表）
 ```
