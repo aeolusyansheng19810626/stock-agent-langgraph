@@ -28,6 +28,7 @@ PARSE_MODEL       = QUALITY_MODEL  # parse_node:  需要世界知识（公司名
 DATA_AGENT_MODEL  = FAST_MODEL     # data_node:   技术面分析
 NEWS_AGENT_MODEL  = FAST_MODEL     # news_node:   新闻摘要
 RAG_AGENT_MODEL   = QUALITY_MODEL  # rag_node:    财报提取（数字/单位处理要求严格，用高质量模型）
+SCORING_MODEL     = QUALITY_MODEL  # scoring_node: 多维度推理评分，需要推理能力
 REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node: Groq 路径（dev_mode 主力 或 Gemini fallback）
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -100,6 +101,43 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - 用户未提供邮箱时 email_params 为 null
 """
 
+SCORING_SYSTEM = """你是一名资深股票分析师，专注于综合量化评分。你将收到一支股票的技术面数据、新闻情绪和财报信息。
+
+请按以下步骤进行推理，将每步的推理结论填入对应 JSON 字段，最终只输出一个纯 JSON 对象，禁止输出任何其他文字。
+
+Step 1 财务健康度分析（financial_score / financial_reasoning）：
+- 逐项分析 PE/PB/ROE/负债率等指标（如有数据）
+- 估值是否偏高/偏低，盈利质量如何
+- 输出 financial_score（0-10）和推理说明
+
+Step 2 市场情绪分析（sentiment_score / sentiment_reasoning）：
+- 分析新闻关键词、正负面倾向、催化剂或风险事件
+- 输出 sentiment_score（0-10）和推理说明
+
+Step 3 技术面分析（technical_score / technical_reasoning）：
+- 分析价格趋势、52 周高低位置、成交量等
+- 输出 technical_score（0-10）和推理说明
+
+Step 4 综合推理（overall_reasoning / final_rating / confidence）：
+- 三维度加权：财务 40%、情绪 30%、技术 30%
+- 指出各维度相互印证或矛盾的关键点
+- 输出 final_rating：强买 / 买入 / 中性 / 卖出 / 强卖
+- 输出 confidence（0-100）和 uncertainty_factors（主要不确定因素列表）
+
+【必须】严格输出以下格式的纯 JSON，禁止输出任何其他文字：
+{
+  "financial_score": <0-10>,
+  "financial_reasoning": "<说明>",
+  "sentiment_score": <0-10>,
+  "sentiment_reasoning": "<说明>",
+  "technical_score": <0-10>,
+  "technical_reasoning": "<说明>",
+  "final_rating": "<强买|买入|中性|卖出|强卖>",
+  "confidence": <0-100>,
+  "uncertainty_factors": ["<因素1>", "<因素2>"],
+  "overall_reasoning": "<综合推理说明>"
+}"""
+
 REPORT_SYSTEM = """你是一个专业的股票分析师，拥有10年股市投资经验。
 
 你将收到由多个数据源汇总而来的上下文（实时股价、历史走势、新闻、财报等），
@@ -135,6 +173,7 @@ class AgentState(TypedDict):
     stock_data: str
     news: str
     rag_result: str
+    scoring_result: dict
 
     report: str
     email_status: str
@@ -524,6 +563,72 @@ def rag_node(state: AgentState) -> dict:
     }
 
 
+def scoring_node(state: AgentState) -> dict:
+    parts = []
+    if state.get("stock_data"):
+        parts.append(f"[技术面数据]\n{state['stock_data']}")
+    if state.get("news"):
+        parts.append(f"[新闻情绪]\n{state['news']}")
+    if state.get("rag_result"):
+        parts.append(f"[财报数据]\n{state['rag_result']}")
+
+    if not parts:
+        return {"scoring_result": {}, "tool_calls": [], "errors": []}
+
+    context = "\n\n".join(parts)
+    errors = []
+    scoring = {}
+    raw = ""
+
+    try:
+        llm = ChatGroq(
+            api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            model=SCORING_MODEL,
+        )
+        resp = llm.invoke([
+            SystemMessage(content=SCORING_SYSTEM),
+            HumanMessage(content=f"请对以下数据进行多维度评分：\n\n{context}"),
+        ])
+        raw = _extract_text(resp.content).strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+
+        try:
+            scoring = json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                try:
+                    scoring = json.loads(match.group())
+                except Exception as parse_exc:
+                    errors.append({
+                        "node": "scoring_node",
+                        "tool": "json_parse",
+                        "message": str(parse_exc),
+                        "retryable": False,
+                    })
+            else:
+                errors.append({
+                    "node": "scoring_node",
+                    "tool": "json_parse",
+                    "message": f"No JSON found in response: {raw[:200]}",
+                    "retryable": False,
+                })
+    except Exception as exc:
+        errors.append({
+            "node": "scoring_node",
+            "tool": "llm_scoring",
+            "message": str(exc),
+            "retryable": False,
+        })
+
+    tool_calls = (
+        [{"tool_name": "scoring_agent", "tool_args": {"model": SCORING_MODEL}}]
+        if scoring else []
+    )
+    return {"scoring_result": scoring, "tool_calls": tool_calls, "errors": errors}
+
+
 def report_node(state: AgentState) -> dict:
     groq_api_key = state.get("groq_api_key") or os.getenv("GROQ_API_KEY", "")
     gemini_api_key = state.get("gemini_api_key") or os.getenv("GEMINI_API_KEY", "")
@@ -538,6 +643,36 @@ def report_node(state: AgentState) -> dict:
     if state.get("rag_result"):
         parts.append(state["rag_result"])
     gathered_data = "\n\n".join(parts) if parts else "No usable data was gathered."
+
+    # 构建评分摘要（如有）
+    scoring_result = state.get("scoring_result") or {}
+    scoring_section = ""
+    scoring_instruction = ""
+    if scoring_result.get("final_rating"):
+        rating = scoring_result.get("final_rating", "N/A")
+        confidence = scoring_result.get("confidence", "N/A")
+        fin_score = scoring_result.get("financial_score", "N/A")
+        sent_score = scoring_result.get("sentiment_score", "N/A")
+        tech_score = scoring_result.get("technical_score", "N/A")
+        overall = scoring_result.get("overall_reasoning", "")
+        uncertainty = "、".join(scoring_result.get("uncertainty_factors") or [])
+        fin_r = scoring_result.get("financial_reasoning", "")
+        sent_r = scoring_result.get("sentiment_reasoning", "")
+        tech_r = scoring_result.get("technical_reasoning", "")
+        scoring_section = (
+            f"[综合评分]\n"
+            f"最终评级：{rating}  置信度：{confidence}%\n"
+            f"财务评分：{fin_score}/10  情绪评分：{sent_score}/10  技术评分：{tech_score}/10\n"
+            f"综合推理：{overall}\n"
+            f"主要不确定因素：{uncertainty}\n"
+            f"财务推理：{fin_r}\n"
+            f"情绪推理：{sent_r}\n"
+            f"技术推理：{tech_r}\n"
+        )
+        scoring_instruction = (
+            "请在报告最开头输出【综合评级摘要】，包含评级、置信度、三维度评分，"
+            "然后在报告正文中引用相关推理链支撑你的分析结论。\n"
+        )
 
     error_items = state.get("errors") or []
     error_lines = [
@@ -554,7 +689,9 @@ def report_node(state: AgentState) -> dict:
     prompt = (
         f"User query: {state['user_input']}\n"
         f"{history_section}\n"
+        f"{scoring_instruction}"
         f"Gathered data:\n{gathered_data}\n\n"
+        f"{scoring_section}"
         f"Tool failures:\n{error_section}\n\n"
         "Write the final answer using only the available information."
     )
@@ -672,6 +809,7 @@ def build_graph():
     builder.add_node("data_node", data_node)
     builder.add_node("news_node", news_node)
     builder.add_node("rag_node", rag_node)
+    builder.add_node("scoring_node", scoring_node)
     builder.add_node("report_node", report_node)
 
     builder.add_edge(START, "parse_node")
@@ -694,9 +832,11 @@ def build_graph():
         ["data_node", "news_node", "rag_node", "report_node"],
     )
 
-    builder.add_edge("data_node", "report_node")
-    builder.add_edge("news_node", "report_node")
-    builder.add_edge("rag_node", "report_node")
+    # 并行节点完成后汇入 scoring_node，再进 report_node
+    builder.add_edge("data_node", "scoring_node")
+    builder.add_edge("news_node", "scoring_node")
+    builder.add_edge("rag_node", "scoring_node")
+    builder.add_edge("scoring_node", "report_node")
     builder.add_edge("report_node", END)
 
     return builder.compile()

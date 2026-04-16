@@ -19,21 +19,23 @@
 整个项目最核心的文件。定义了 5 个节点，每个节点都是真正的 Agent：
 
 ```
-parse_node   → 理解用户问题，决定要调用哪些 agent（输出 JSON 调度计划）
-data_node    → 调用 yfinance 获取股价数据，再用 LLM 做技术面分析
-news_node    → 调用 Tavily 搜索新闻，再用 LLM 做摘要和情绪判断
-rag_node     → 调用 ChromaDB 检索财报，再用 LLM 提取关键财务指标
-report_node  → 汇总各 agent 的预分析结论，生成最终投资分析报告
+parse_node    → 理解用户问题，决定要调用哪些 agent（输出 JSON 调度计划）
+data_node     → 调用 yfinance 获取股价数据，再用 LLM 做技术面分析
+news_node     → 调用 Tavily 搜索新闻，再用 LLM 做摘要和情绪判断
+rag_node      → 调用 ChromaDB 检索财报，再用 LLM 提取关键财务指标
+scoring_node  → 汇总三路预分析结论，Chain-of-Thought 推理输出多维度评分 JSON
+report_node   → 整合评分结论，生成带评级摘要的最终投资分析报告
 ```
 
 `parse_node` 执行完后，`data/news/rag` 三个节点**并行执行**，
-全部完成后 `report_node` 才开始生成报告。
+全部完成后进入 `scoring_node` 评分，再由 `report_node` 生成最终报告。
 
-`report_node` 接收的不是原始数据，而是各 agent 已经预分析过的结论。
+`scoring_node` 输出结构化 JSON（财务/情绪/技术三维评分 + 最终评级 + 置信度），
+`report_node` 在报告顶部展示评级摘要，正文中引用推理链。
 
 模型分工（在文件顶部集中配置，改常量即可）：
 - `data_node / news_node` → LLaMA（快速模型，via Groq）
-- `parse_node / rag_node` → openai/gpt-oss-120b（需要世界知识 / 严格数字处理）
+- `parse_node / rag_node / scoring_node` → openai/gpt-oss-120b（需要推理能力）
 - `report_node` 主力 → Gemini 2.5 Flash（运行模式）
 - `report_node` fallback → openai/gpt-oss-120b（via Groq）
 
@@ -107,7 +109,9 @@ graph.py → parse_node（规划，输出 JSON 调度计划）
          news_node（Tavily   → LLM 新闻摘要）
          rag_node （ChromaDB → LLM 财务提取）
               ↓ 汇总预分析结论
-         report_node（生成最终报告）
+         scoring_node（CoT 多维度评分 → JSON）
+              ↓
+         report_node（生成带评级摘要的最终报告）
   ↓
 app.py（显示报告 + 图表）
 ```
