@@ -1,0 +1,581 @@
+"""LangGraph multi-agent graph for stock analysis."""
+
+import json
+import operator
+import os
+import re
+from datetime import datetime
+from typing import Annotated, List, Optional, TypedDict
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_groq import ChatGroq
+from langgraph.graph import END, START, StateGraph
+
+from tools import (
+    get_stock_data,
+    get_stock_history,
+    search_documents,
+    search_web,
+    send_email_report,
+)
+
+
+PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，输出一个 JSON 调度计划。
+
+严格输出纯 JSON，不要 markdown 代码块，不要任何解释文字。
+
+格式：
+{
+  "agents": ["data"],
+  "data_params": {"tickers": ["AAPL"], "need_history": false, "periods": ["6mo"]},
+  "news_params": {"query": "Apple latest news 2025"},
+  "rag_params": {"query": "Apple revenue earnings Q4"},
+  "email_params": null
+}
+
+agents 字段从以下选择（可多选）：data / news / rag / email
+  data  → 查询股价、涨跌、估值、走势图
+  news  → 查询新闻、近期动态、催化剂、市场消息
+  rag   → 查询财报、营收、利润、EPS、毛利率、季报、年报
+  email → 用户明确要求发送邮件报告
+
+路由规则（严格遵守）：
+  - 只问股价/走势  → agents: ["data"]
+  - 只问新闻      → agents: ["news"]
+  - 只问财报      → agents: ["rag"]
+  - 综合分析      → agents: ["data", "news", "rag"]
+  - 需要走势图    → need_history: true
+  - 不需要某 agent → 对应 params 置 null
+
+字段要求：
+  - tickers: 标准大写股票代码（AAPL/TSLA/NVDA/MSFT 等），从用户问题中提取
+  - news/rag query: 英文关键词，包含公司名和具体主题
+  - email_params: 用户明确要求发邮件时填写 {"to": "邮箱地址", "subject": "主题"}，否则 null
+  - 用户未提供邮箱时 email_params 为 null
+"""
+
+REPORT_SYSTEM = """你是一个专业的股票分析师，拥有10年股市投资经验。
+
+你将收到由多个数据源汇总而来的上下文（实时股价、历史走势、新闻、财报等），
+请基于这些数据为用户的问题生成一份详细的分析报告。
+
+要求：
+- 直接切题，基于提供的数据回答，不要编造数据
+- 回答深度视问题而定：简单问题直接回答，综合分析需包含基本面、技术面、近期动态、投资建议和风险提示
+- 回答用中文，长度不少于300字（综合分析不少于500字）
+- 工具失败或数据缺失时，明确说明哪些数据不可用
+- 风险提示必须包含
+"""
+
+
+class AgentState(TypedDict):
+    user_input: str
+    chat_history_text: str
+
+    tickers: List[str]
+    need_data: bool
+    need_news: bool
+    need_rag: bool
+    need_history: bool
+    periods: List[str]
+    news_query: str
+    rag_query: str
+    email_params: Optional[dict]
+    rag_available: bool
+
+    tool_calls: Annotated[List[dict], operator.add]
+    errors: Annotated[List[dict], operator.add]
+
+    stock_data: str
+    news: str
+    rag_result: str
+
+    report: str
+    email_status: str
+    final_model: str
+    gemini_exhausted: bool
+
+    groq_api_key: str
+    gemini_api_key: str
+    dev_mode: bool
+
+
+def _parse_plan(text: str) -> dict:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group())
+
+
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
+def _extract_tickers(text: str) -> List[str]:
+    candidates = re.findall(r"\b[A-Z]{1,5}(?:\.[A-Z]{1,3})?\b", text.upper())
+    stopwords = {
+        "USD", "CNY", "HKD", "JPY", "RMB", "CEO", "CPI", "PPI", "EPS", "PE",
+        "AI", "PDF", "ETF", "EV", "IPO", "THE", "AND", "FOR", "WITH", "FROM",
+    }
+    seen = []
+    for candidate in candidates:
+        if candidate in stopwords or candidate in seen:
+            continue
+        seen.append(candidate)
+    return seen
+
+
+def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
+    text = user_input.lower()
+    tickers = _extract_tickers(user_input)
+
+    need_data = bool(tickers) or any(
+        kw in text for kw in ("price", "quote", "valuation", "market cap", "stock", "ticker")
+    )
+    need_history = any(
+        kw in text for kw in ("history", "trend", "chart", "6mo", "3mo", "1y", "2y")
+    )
+    need_news = any(
+        kw in text for kw in ("news", "latest", "update", "catalyst", "headline")
+    )
+    need_rag = rag_available and any(
+        kw in text for kw in ("pdf", "document", "report", "earnings", "uploaded", "file")
+    )
+    need_email = any(kw in text for kw in ("email", "mail", "send"))
+
+    if need_history:
+        need_data = True
+
+    agents = []
+    if need_data:
+        agents.append("data")
+    if need_news:
+        agents.append("news")
+    if need_rag:
+        agents.append("rag")
+    if need_email:
+        agents.append("email")
+
+    if not agents:
+        agents = ["news"] if not tickers else ["data"]
+
+    return {
+        "agents": agents,
+        "data_params": {
+            "tickers": tickers,
+            "need_history": need_history,
+            "periods": ["6mo"] * len(tickers),
+        } if need_data else None,
+        "news_params": {"query": user_input} if need_news or agents == ["news"] else None,
+        "rag_params": {"query": user_input} if need_rag else None,
+        "email_params": None,
+    }
+
+
+def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
+    if not isinstance(plan, dict):
+        return _infer_plan_from_text(user_input, rag_available)
+
+    allowed_agents = {"data", "news", "rag", "email"}
+    agents = [agent for agent in plan.get("agents", []) if agent in allowed_agents]
+    data_params = plan.get("data_params") if isinstance(plan.get("data_params"), dict) else {}
+    news_params = plan.get("news_params") if isinstance(plan.get("news_params"), dict) else {}
+    rag_params = plan.get("rag_params") if isinstance(plan.get("rag_params"), dict) else {}
+    email_params = plan.get("email_params") if isinstance(plan.get("email_params"), dict) else None
+
+    tickers = [str(ticker).upper() for ticker in data_params.get("tickers", []) if str(ticker).strip()]
+    if "data" in agents and not tickers:
+        tickers = _extract_tickers(user_input)
+
+    need_history = bool(data_params.get("need_history", False))
+    periods = [str(period) for period in data_params.get("periods", []) if str(period).strip()]
+    if tickers and len(periods) < len(tickers):
+        periods.extend(["6mo"] * (len(tickers) - len(periods)))
+
+    if need_history and "data" not in agents:
+        agents.append("data")
+    if "data" in agents and not tickers:
+        agents.remove("data")
+
+    news_query = str(news_params.get("query", "")).strip()
+    if "news" in agents and not news_query:
+        news_query = user_input
+
+    rag_query = str(rag_params.get("query", "")).strip()
+    if "rag" in agents:
+        if not rag_available:
+            agents.remove("rag")
+            rag_query = ""
+        elif not rag_query:
+            rag_query = user_input
+
+    if email_params and not str(email_params.get("to", "")).strip():
+        email_params = None
+
+    if not agents:
+        return _infer_plan_from_text(user_input, rag_available)
+
+    return {
+        "agents": agents,
+        "data_params": {
+            "tickers": tickers,
+            "need_history": need_history,
+            "periods": periods or (["6mo"] * len(tickers)),
+        } if "data" in agents else None,
+        "news_params": {"query": news_query} if "news" in agents else None,
+        "rag_params": {"query": rag_query} if "rag" in agents else None,
+        "email_params": email_params,
+    }
+
+
+def parse_node(state: AgentState) -> dict:
+    groq = ChatGroq(
+        api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+        # model="meta-llama/llama-4-scout-17b-16e-instruct",
+        model="openai/gpt-oss-120b",
+    )
+
+    history_ctx = state.get("chat_history_text", "")
+    planner_error = None
+    rag_available = bool(state.get("rag_available", False))
+
+    history_prefix = f"History:\n{history_ctx}\n" if history_ctx else ""
+    plan_messages = [
+        SystemMessage(content=PLAN_SYSTEM),
+        HumanMessage(content=f"{history_prefix}User query: {state['user_input']}"),
+    ]
+
+    try:
+        plan_resp = groq.invoke(plan_messages)
+        raw_plan = _parse_plan(_extract_text(plan_resp.content))
+    except Exception as exc:
+        planner_error = str(exc)
+        raw_plan = _infer_plan_from_text(state["user_input"], rag_available)
+
+    plan = _normalize_plan(raw_plan, state["user_input"], rag_available)
+    agents = plan.get("agents", [])
+    data_params = plan.get("data_params") or {}
+    news_params = plan.get("news_params") or {}
+    rag_params = plan.get("rag_params") or {}
+
+    result = {
+        "tickers": data_params.get("tickers", []),
+        "need_data": "data" in agents and bool(data_params.get("tickers")),
+        "need_news": "news" in agents and bool(news_params.get("query")),
+        "need_rag": "rag" in agents and bool(rag_params.get("query")),
+        "need_history": bool(data_params.get("need_history", False)),
+        "periods": data_params.get("periods", []),
+        "news_query": news_params.get("query", ""),
+        "rag_query": rag_params.get("query", ""),
+        "email_params": plan.get("email_params"),
+        "errors": [],
+    }
+
+    if planner_error:
+        result["errors"] = [{
+            "node": "parse_node",
+            "tool": "planner",
+            "message": planner_error,
+            "retryable": True,
+        }]
+
+    return result
+
+
+def data_node(state: AgentState) -> dict:
+    if not state.get("need_data"):
+        return {"stock_data": "", "tool_calls": [], "errors": []}
+
+    tickers = state["tickers"]
+    need_history = state.get("need_history", False)
+    periods = state.get("periods") or ["6mo"] * len(tickers)
+
+    tool_calls = []
+    results = []
+    errors = []
+
+    for ticker in tickers:
+        try:
+            result = get_stock_data.invoke({"ticker": ticker})
+            tool_calls.append({"tool_name": "get_stock_data", "tool_args": {"ticker": ticker}})
+            results.append(f"[Stock Data: {ticker}]\n{result}")
+        except Exception as exc:
+            errors.append({
+                "node": "data_node",
+                "tool": "get_stock_data",
+                "message": f"{ticker}: {exc}",
+                "retryable": True,
+            })
+
+    if need_history:
+        for index, ticker in enumerate(tickers):
+            period = periods[index] if index < len(periods) else "6mo"
+            try:
+                result = get_stock_history.invoke({"ticker": ticker, "period": period})
+                tool_calls.append({
+                    "tool_name": "get_stock_history",
+                    "tool_args": {"ticker": ticker, "period": period},
+                })
+                results.append(f"[Price History: {ticker} / {period}]\n{result}")
+            except Exception as exc:
+                errors.append({
+                    "node": "data_node",
+                    "tool": "get_stock_history",
+                    "message": f"{ticker}/{period}: {exc}",
+                    "retryable": True,
+                })
+
+    return {
+        "stock_data": "\n\n".join(results),
+        "tool_calls": tool_calls,
+        "errors": errors,
+    }
+
+
+def news_node(state: AgentState) -> dict:
+    if not state.get("need_news"):
+        return {"news": "", "tool_calls": [], "errors": []}
+
+    query = state["news_query"]
+    current_year = str(datetime.now().year)
+    if current_year not in query:
+        query = f"{query} {current_year}"
+    try:
+        result = search_web.invoke({"query": query})
+        return {
+            "news": f"[Web News]\n{result}",
+            "tool_calls": [{"tool_name": "search_web", "tool_args": {"query": query}}],
+            "errors": [],
+        }
+    except Exception as exc:
+        return {
+            "news": "",
+            "tool_calls": [],
+            "errors": [{
+                "node": "news_node",
+                "tool": "search_web",
+                "message": str(exc),
+                "retryable": True,
+            }],
+        }
+
+
+def rag_node(state: AgentState) -> dict:
+    if not state.get("need_rag"):
+        return {"rag_result": "", "tool_calls": [], "errors": []}
+
+    query = state["rag_query"]
+    try:
+        result = search_documents.invoke({"query": query})
+        return {
+            "rag_result": f"[Document Retrieval]\n{result}",
+            "tool_calls": [{"tool_name": "search_documents", "tool_args": {"query": query}}],
+            "errors": [],
+        }
+    except Exception as exc:
+        return {
+            "rag_result": "",
+            "tool_calls": [],
+            "errors": [{
+                "node": "rag_node",
+                "tool": "search_documents",
+                "message": str(exc),
+                "retryable": True,
+            }],
+        }
+
+
+def report_node(state: AgentState) -> dict:
+    groq_api_key = state.get("groq_api_key") or os.getenv("GROQ_API_KEY", "")
+    gemini_api_key = state.get("gemini_api_key") or os.getenv("GEMINI_API_KEY", "")
+    dev_mode = state.get("dev_mode", False)
+    gemini_exhausted = state.get("gemini_exhausted", False)
+
+    parts = []
+    if state.get("stock_data"):
+        parts.append(state["stock_data"])
+    if state.get("news"):
+        parts.append(state["news"])
+    if state.get("rag_result"):
+        parts.append(state["rag_result"])
+    gathered_data = "\n\n".join(parts) if parts else "No usable data was gathered."
+
+    error_items = state.get("errors") or []
+    error_lines = [
+        f"- {item.get('node', 'unknown')}/{item.get('tool', 'unknown')}: {item.get('message', '')}"
+        for item in error_items
+    ]
+    error_section = "\n".join(error_lines) if error_lines else "- none"
+
+    history_section = (
+        f"\nHistory:\n{state['chat_history_text']}\n"
+        if state.get("chat_history_text")
+        else ""
+    )
+    prompt = (
+        f"User query: {state['user_input']}\n"
+        f"{history_section}\n"
+        f"Gathered data:\n{gathered_data}\n\n"
+        f"Tool failures:\n{error_section}\n\n"
+        "Write the final answer using only the available information."
+    )
+    messages = [SystemMessage(content=REPORT_SYSTEM), HumanMessage(content=prompt)]
+
+    def call_groq() -> str:
+        llm = ChatGroq(
+            api_key=groq_api_key,
+            # model="meta-llama/llama-4-scout-17b-16e-instruct",
+            model="openai/gpt-oss-120b",
+        )
+        resp = llm.invoke(messages)
+        return _extract_text(resp.content)
+
+    if dev_mode or gemini_exhausted:
+        response = call_groq()
+        final_model = "Groq"
+        new_gemini_exhausted = False
+    else:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
+
+        response = None
+        final_model = "Groq"
+        new_gemini_exhausted = False
+        gemini_llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=gemini_api_key,
+            temperature=0.1,
+        )
+
+        try:
+            resp = gemini_llm.invoke(messages)
+            text = _extract_text(resp.content)
+            if text.strip():
+                response = text
+                final_model = "Gemini"
+            else:
+                response = call_groq()
+                final_model = "Groq"
+        except ChatGoogleGenerativeAIError as exc:
+            err = str(exc)
+            if "429" not in err and "RESOURCE_EXHAUSTED" not in err:
+                raise
+            response = call_groq()
+            final_model = "Groq"
+            new_gemini_exhausted = "RESOURCE_EXHAUSTED" in err
+
+        if response is None:
+            response = call_groq()
+
+    email_tool_calls = []
+    email_errors = []
+    email_status = ""
+    email_params = state.get("email_params")
+    if email_params and email_params.get("to"):
+        email_to = email_params["to"]
+        email_subject = email_params.get("subject", "AI Stock Analysis Report")
+        try:
+            email_result = send_email_report.invoke({
+                "to": email_to,
+                "subject": email_subject,
+                "body": response,
+            })
+            parsed_email_result = None
+            if isinstance(email_result, str):
+                try:
+                    parsed_email_result = json.loads(email_result)
+                except json.JSONDecodeError:
+                    parsed_email_result = None
+
+            if isinstance(parsed_email_result, dict) and parsed_email_result.get("ok") is True:
+                email_tool_calls.append({
+                    "tool_name": "send_email_report",
+                    "tool_args": {"to": email_to, "subject": email_subject},
+                })
+                email_status = f"Sent to {email_to}"
+            else:
+                failure_message = (
+                    parsed_email_result.get("message", str(email_result))
+                    if isinstance(parsed_email_result, dict)
+                    else str(email_result)
+                )
+                email_errors.append({
+                    "node": "report_node",
+                    "tool": "send_email_report",
+                    "message": failure_message,
+                    "retryable": True,
+                })
+                email_status = f"Not sent. {failure_message}"
+        except Exception as exc:
+            email_errors.append({
+                "node": "report_node",
+                "tool": "send_email_report",
+                "message": str(exc),
+                "retryable": True,
+            })
+            email_status = f"Not sent. {exc}"
+
+    return {
+        "report": response,
+        "email_status": email_status,
+        "final_model": final_model,
+        "gemini_exhausted": new_gemini_exhausted,
+        "tool_calls": email_tool_calls,
+        "errors": email_errors,
+    }
+
+
+def build_graph():
+    builder = StateGraph(AgentState)
+
+    builder.add_node("parse_node", parse_node)
+    builder.add_node("data_node", data_node)
+    builder.add_node("news_node", news_node)
+    builder.add_node("rag_node", rag_node)
+    builder.add_node("report_node", report_node)
+
+    builder.add_edge(START, "parse_node")
+
+    def route_to_agents(state: AgentState):
+        targets = []
+        if state.get("need_data"):
+            targets.append("data_node")
+        if state.get("need_news"):
+            targets.append("news_node")
+        if state.get("need_rag"):
+            targets.append("rag_node")
+        if not targets:
+            return "report_node"
+        return targets
+
+    builder.add_conditional_edges(
+        "parse_node",
+        route_to_agents,
+        ["data_node", "news_node", "rag_node", "report_node"],
+    )
+
+    builder.add_edge("data_node", "report_node")
+    builder.add_edge("news_node", "report_node")
+    builder.add_edge("rag_node", "report_node")
+    builder.add_edge("report_node", END)
+
+    return builder.compile()
+
+
+graph = build_graph()

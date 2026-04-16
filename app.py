@@ -136,31 +136,12 @@ def process_uploaded_pdfs(files):
         _save_processed_registry(registry)
         invalidate_vectorstore()  # 让 search_documents 重新加载最新向量库
 
-# ====== 初始化 LLM 和工具（按模型缓存） ======
-@st.cache_resource
-def init_agents():
-    from langchain_groq import ChatGroq
-    from langchain_google_genai import ChatGoogleGenerativeAI
-
-    tools = [get_stock_data, search_web, get_stock_history, send_email_report, search_documents]
-    tools_map = {t.name: t for t in tools}
-
-    groq_llm = ChatGroq(
-        api_key=os.environ.get("GROQ_API_KEY", GROQ_API_KEY),
-        # model="openai/gpt-oss-120b",
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-    )
-    gemini_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=os.environ.get("GEMINI_API_KEY", GEMINI_API_KEY),
-        temperature=0.1,
-    )
-
-    groq_with_tools   = groq_llm.bind_tools(tools)
-    gemini_with_tools = gemini_llm.bind_tools(tools)
-    return groq_llm, groq_with_tools, gemini_with_tools, tools_map
-
 # ====== 页面配置 ======
+@st.cache_resource(show_spinner="正在加载 AI 引擎…")
+def _load_graph():
+    from graph import graph as _g
+    return _g
+
 st.set_page_config(
     page_title="AI股票分析 · moomoo风格",
     page_icon="📈",
@@ -330,6 +311,9 @@ section[data-testid="stSidebar"] {
     box-shadow: var(--shadow-md) !important;
     font-size: 0.92rem !important;
     line-height: 1.7 !important;
+    overflow-wrap: break-word !important;
+    word-break: break-word !important;
+    min-width: 0 !important;
 }
 
 /* 消息内文字 */
@@ -957,6 +941,26 @@ for msg in st.session_state.messages:
             <span class="tc-status">✓ 完成</span>
         </div>
         """, unsafe_allow_html=True)
+    elif role == "email_status":
+        is_sent = bool(msg.get("sent"))
+        border = "#00C087" if is_sent else "#F5475B"
+        bg = "#E6F9F4" if is_sent else "#FEF0F2"
+        label = "Email Sent" if is_sent else "Email Failed"
+        st.markdown(f"""
+        <div style="
+            background:{bg};
+            border:1px solid {border};
+            border-left:4px solid {border};
+            border-radius:8px;
+            padding:10px 14px;
+            margin:8px 0 12px;
+            color:#1D2129;
+            font-size:0.88rem;
+        ">
+            <div style="font-weight:700;margin-bottom:4px;">{label}</div>
+            <div>{msg["content"]}</div>
+        </div>
+        """, unsafe_allow_html=True)
     elif role == "chart":
         ticker = msg.get("caption", "走势图").replace(" 历史走势图", "")
         st.markdown(f"""
@@ -1013,9 +1017,7 @@ if user_input:
     charts_before = set(glob.glob("charts/*.png"))
 
     try:
-        # ====== 多 Agent 执行 ======
-        from agents.orchestrator import run as orchestrator_run
-
+        # ====== LangGraph 多 Agent 执行 ======
         TOOL_LABEL = {
             "get_stock_data":    "获取股票实时数据",
             "search_web":        "搜索网络新闻",
@@ -1024,14 +1026,65 @@ if user_input:
             "send_email_report": "发送邮件报告",
         }
 
+        # 格式化对话历史供图节点使用
+        chat_history_text = ""
+        for _msg in st.session_state.chat_history[-4:]:
+            _cls = _msg.__class__.__name__
+            if _cls in ("HumanMessage", "AIMessage"):
+                _role = "用户" if _cls == "HumanMessage" else "助手"
+                chat_history_text += f"{_role}: {str(_msg.content)[:300]}\n"
+
         with st.status("AI 正在分析…", expanded=True) as status_box:
-            result = orchestrator_run(
-                user_query=user_input,
-                chat_history=st.session_state.chat_history,
-                dev_mode=st.session_state.dev_mode,
-                gemini_exhausted=st.session_state.gemini_exhausted,
-                status_callback=lambda msg: status_box.update(label=msg),
-            )
+            _initial_state = {
+                "user_input":        user_input,
+                "chat_history_text": chat_history_text,
+                "groq_api_key":      GROQ_API_KEY,
+                "gemini_api_key":    GEMINI_API_KEY,
+                "dev_mode":          st.session_state.dev_mode,
+                "gemini_exhausted":  st.session_state.gemini_exhausted,
+                "rag_available":     bool(st.session_state.processed_docs),
+                "tool_calls":        [],
+                "errors":            [],
+            }
+
+            _all_tool_calls      = []
+            _final_report        = ""
+            _email_status        = ""
+            _final_model         = "Groq"
+            _new_gemini_exhausted = False
+
+            for _update in _load_graph().stream(_initial_state, stream_mode="updates"):
+                for _node_name, _node_output in _update.items():
+                    # Real-time status updates
+                    if _node_name == "parse_node":
+                        status_box.update(label="正在分析问题，制定调度计划…")
+                    elif _node_name == "data_node" and _node_output.get("stock_data"):
+                        status_box.update(label="正在获取股票数据…")
+                    elif _node_name == "news_node" and _node_output.get("news"):
+                        status_box.update(label="正在搜索最新新闻…")
+                    elif _node_name == "rag_node" and _node_output.get("rag_result"):
+                        status_box.update(label="正在检索财报文档…")
+                    elif _node_name == "report_node":
+                        _model_label = "Groq" if (
+                            st.session_state.dev_mode or st.session_state.gemini_exhausted
+                        ) else "Gemini"
+                        status_box.update(label=f"正在生成分析报告（{_model_label}）…")
+                    # Accumulate tool calls from each node's delta output
+                    if "tool_calls" in _node_output:
+                        _all_tool_calls.extend(_node_output["tool_calls"])
+                    if _node_name == "report_node":
+                        _final_report         = _node_output.get("report", "")
+                        _email_status         = _node_output.get("email_status", "")
+                        _final_model          = _node_output.get("final_model", "Groq")
+                        _new_gemini_exhausted = _node_output.get("gemini_exhausted", False)
+
+            result = {
+                "tool_calls":       _all_tool_calls,
+                "final_response":   _final_report,
+                "email_status":     _email_status,
+                "final_model":      _final_model,
+                "gemini_exhausted": _new_gemini_exhausted,
+            }
 
             # Gemini 日配额耗尽时更新状态
             if result.get("gemini_exhausted"):
@@ -1062,6 +1115,19 @@ if user_input:
             status_box.update(label="✅ 分析完成", state="complete", expanded=False)
 
         # ====== 显示本次新生成的走势图 ======
+            if result.get("email_status"):
+                email_status_text = result["email_status"]
+                email_sent = email_status_text.startswith("Sent to ")
+                if email_sent:
+                    st.success(f"Email: {email_status_text}")
+                else:
+                    st.error(f"Email: {email_status_text}")
+                st.session_state.messages.append({
+                    "role": "email_status",
+                    "content": email_status_text,
+                    "sent": email_sent,
+                })
+
         charts_after = set(glob.glob("charts/*.png"))
         new_charts = sorted(charts_after - charts_before)
         for chart_path in new_charts:

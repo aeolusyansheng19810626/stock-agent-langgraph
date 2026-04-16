@@ -1,31 +1,17 @@
 # StockAI 股票分析 Agent
 
-基于 LangChain 的智能股票分析助手，支持 Streamlit Web UI 和命令行两种使用方式。
+基于 **LangGraph** 的多 Agent 并行股票分析助手，Streamlit Web UI。
 
 ---
 
-## 环境搭建
+## 启动方式
 
 ```bash
-# 创建虚拟环境
-python -m venv venv
-
-# 激活（Windows）
-venv\Scripts\activate
-
 # 安装依赖
 pip install -r requirements.txt
-pip install langchain-groq langchain-google-genai streamlit
-```
 
-### 启动 Web UI
-```bash
-venv\Scripts\streamlit.exe run app.py
-```
-
-### 启动命令行版
-```bash
-python main.py
+# 启动
+python -m streamlit run app.py
 ```
 
 ---
@@ -33,22 +19,16 @@ python main.py
 ## 项目结构
 
 ```
-stock-agent/
+stock-agent-langgraph/
 ├── app.py              # Streamlit Web UI（主程序）
-├── main.py             # 命令行版本
+├── graph.py            # LangGraph 多 Agent 图（核心）
 ├── tools.py            # 工具定义（不要修改）
 ├── components/
-│   └── stock_ticker.py # 实时股价侧边栏组件
+│   └── stock_ticker.py # 实时股价侧边栏组件（@st.fragment 30s刷新）
 ├── skills/             # 工具使用说明（注入 system prompt）
-│   ├── skill_get_stock_data.md
-│   ├── skill_get_stock_history.md
-│   ├── skill_search_web.md
-│   └── skill_send_email.md
 ├── charts/             # 走势图输出目录（运行时自动创建）
 ├── vectorstore/        # ChromaDB 向量库（运行时自动创建，不上传 git）
 ├── .env                # API Keys（不上传 git，参考 .env.example）
-├── .env.example        # API Keys 模板
-├── token.pickle        # Gmail OAuth 凭证（不上传 git）
 └── requirements.txt
 ```
 
@@ -56,130 +36,143 @@ stock-agent/
 
 ## API Keys
 
-所有 key 存放在项目根目录的 `.env` 文件中（不上传 git），通过 `python-dotenv` 读取。
-
 ```
 GROQ_API_KEY=your_groq_api_key
 GEMINI_API_KEY=your_gemini_api_key
 TAVILY_API_KEY=your_tavily_api_key
 ```
 
-换机器时，参考 `.env.example` 创建 `.env` 并填入对应的 key。代码中通过 `os.getenv()` 读取，不会硬编码在源文件里。
-
 ---
 
-## 双模型架构
+## LangGraph 多 Agent 架构
 
 ```
 用户提问
    ↓
-Groq（工具调用循环）
-   ├─ 调用 get_stock_data
-   ├─ 调用 search_web
-   ├─ 调用 get_stock_history
-   └─ 调用 send_email_report
-   ↓
-Gemini（生成最终分析报告）
-   ↓（429 限速）
-等待 65 秒重试
-   ↓（重试仍 429）
-Groq 降级兜底
+parse_node（openai/gpt-oss-120b via Groq）
+  └─ 分析问题，生成调度计划（JSON）
+   ↓ 条件路由（并行）
+   ├─ data_node   → yfinance 股价 + 走势图
+   ├─ news_node   → Tavily 新闻搜索（自动追加当前年份）
+   └─ rag_node    → ChromaDB 财报检索
+   ↓ fan-in（等待所有节点完成）
+report_node
+  ├─ 运行模式：Gemini 2.5 Flash（失败时 fallback → Groq）
+  └─ 开发模式：openai/gpt-oss-120b via Groq
 ```
 
-- **Groq**：负责多步工具调用，无日配额限制
-- **Gemini 2.5 Flash**：负责生成最终高质量报告
-- **Gemini 返回空内容**：自动降级到 Groq
+### AgentState 关键字段
+
+```python
+class AgentState(TypedDict):
+    user_input: str
+    chat_history_text: str
+    tickers: List[str]
+    need_data: bool; need_news: bool; need_rag: bool; need_history: bool
+    stock_data: str; news: str; rag_result: str
+    report: str; email_status: str; final_model: str
+    gemini_exhausted: bool
+    tool_calls: Annotated[List[dict], operator.add]  # 并行节点自动合并
+    errors:    Annotated[List[dict], operator.add]
+```
+
+### 并行执行原理
+
+- LangGraph 通过 `add_conditional_edges` 实现 fan-out，多节点同时调度
+- `Annotated[List, operator.add]` reducer 自动合并各节点的 tool_calls
+- `stream_mode="updates"` 实时推送每个节点完成状态到 Streamlit status box
+- 总耗时 ≈ 最慢节点的时间，而非各节点之和
+
+### 条件路由逻辑（parse_node → 各节点）
+
+```python
+def route_to_agents(state):
+    targets = []
+    if state.get("need_data"):  targets.append("data_node")
+    if state.get("need_news"):  targets.append("news_node")
+    if state.get("need_rag"):   targets.append("rag_node")
+    return targets or "report_node"  # 无需数据时直接生成报告
+```
 
 ---
 
-## Gemini 免费层限制
+## 双模式运行
+
+| 模式 | parse_node | report_node |
+|------|-----------|-------------|
+| 开发模式（dev_mode=True） | openai/gpt-oss-120b | openai/gpt-oss-120b |
+| 运行模式（dev_mode=False） | openai/gpt-oss-120b | Gemini 2.5 Flash → Groq fallback |
+
+切换：侧边栏「🛠️ 开发模式」toggle
+
+---
+
+## Gemini 配额
 
 | 限制 | 额度 |
 |------|------|
-| RPM（每分钟请求数） | 5 |
-| RPD（每日请求数） | 20 |
-| 配额重置时间 | 北京时间 15:00 / 日本时间 16:00（夏令时） |
+| RPM | 5 |
+| RPD | 20 |
+| 重置时间 | 北京时间 15:00 |
 
-### 限速处理逻辑
-1. 触发 429 → 等待 65 秒自动重试（应对 RPM 打满）
-2. 重试仍然 429 → 标记 `gemini_exhausted = True`，后续请求直接走 Groq
-3. 刷新页面 → 状态重置，恢复使用 Gemini
+- `RESOURCE_EXHAUSTED` → 标记 `gemini_exhausted=True`，后续直接走 Groq
+- 侧边栏「🔴 Gemini 已耗尽」按钮可手动恢复
 
 ---
 
 ## 工具说明
 
 ### `get_stock_data(ticker)`
-- 数据源：yfinance
-- 返回：当前价格、涨跌幅、52周高低点、市盈率、成交量
+- 数据源：yfinance，返回实时价格、涨跌幅、52周高低、PE、成交量
 
 ### `search_web(query)`
-- 数据源：Tavily API
-- 搜索关键词必须用英文，每次返回 3 条结果
-- 自动附加当天日期提升结果时效性
+- 数据源：Tavily API，返回 3 条结果
+- news_node 自动追加当前年份，确保返回最新新闻
 
 ### `get_stock_history(ticker, period)`
-- period 可选：`1mo` / `3mo` / `6mo` / `1y` / `2y`
-- 走势图保存到 `charts/` 目录，Streamlit 页面自动显示
+- period：`1mo` / `3mo` / `6mo` / `1y` / `2y`
+- 走势图保存到 `charts/`，dpi=100（平衡质量与传输速度）
 
 ### `search_documents(query)`
-- 从已上传的财报 PDF 中检索相关内容
-- 向量库持久化到 `./vectorstore`，重启后不丢失
-- 嵌入模型：`paraphrase-multilingual-MiniLM-L12-v2`（支持中文，本地运行）
-- 首次上传 PDF 时会自动下载模型（约 120MB）
+- ChromaDB + `paraphrase-multilingual-MiniLM-L12-v2`（本地，支持中文，约 120MB）
+- 向量库持久化，重启不丢失；首次上传 PDF 自动下载模型
 
 ### `send_email_report(to, subject, body)`
-- 通过 Gmail API 发送
-- 首次使用需要 OAuth 授权，会生成 `token.pickle`
-- `token.pickle` 不要删除，否则需要重新授权
+- Gmail API，首次需 OAuth 授权生成 `token.pickle`
 
 ---
 
-## Gmail OAuth 初始化
+## 性能优化记录
 
-首次使用邮件功能时需要授权：
-1. 运行程序后触发邮件发送
-2. 浏览器弹出 Google 授权页面
-3. 授权完成后生成 `token.pickle`，后续自动使用
-
-换机器时需要把 `token.pickle` 一起复制过去，或重新授权。
+- `@st.cache_resource` 包装 graph 加载，避免每次 rerun 重新编译
+- 走势图 dpi=100（原150），文件体积减少约55%，渲染更快
+- news_node 自动注入年份，避免 Tavily 返回旧数据
 
 ---
 
-## System Prompt 编写经验
+## System Prompt 经验
 
-本项目用 Groq（LLaMA）负责工具调用，LLaMA 对指令的遵循能力相对较弱，system prompt 的措辞对工具选择行为影响很大。
+对 LLM 下指令要用强制句式，而不是建议：
 
-### 各模型遵循指令能力对比
-
-| 模型 | 能力 | 说明 |
-|------|------|------|
-| Claude | 最强 | 软语气（"优先"、"先调用"）基本能遵守 |
-| GPT-4o | 强 | 大多数情况够用，复杂场景偶尔需要加强 |
-| Gemini 2.5 Flash | 中等 | 工具选择比 GPT-4o 弱，措辞需稍明确 |
-| LLaMA（Groq） | 较弱 | 软语气容易忽略，必须用强制句式 |
-
-### 结论：对 LLM 下指令要像写强制规定，而不是建议
-
-**无效写法（LLaMA 容易忽略）：**
 ```
+# 无效（LLM 容易忽略）
 如果用户询问财务数据，优先调用 search_documents
+
+# 有效
+用户询问财报时，【必须】首先调用 search_documents，禁止直接调用 search_web
 ```
 
-**有效写法：**
-```
-用户询问财报、财务数据时，【必须】首先调用 search_documents，禁止直接调用 search_web 或使用训练数据回答
-```
-
-两个关键点：
-1. system prompt 用禁止句式（"禁止"、"【必须】"）
-2. tool description 里也同步加强，LLM 选工具时会同时参考两处
+| 模型 | 指令遵循能力 |
+|------|------------|
+| Claude | 最强，软语气即可 |
+| GPT-4o / gpt-oss-120b | 强 |
+| Gemini 2.5 Flash | 中等 |
+| LLaMA（Groq） | 较弱，需强制句式 |
 
 ---
 
 ## 注意事项
 
-- `tools.py` 不要随意修改，工具签名变更会影响 LangChain 工具绑定
-- `skills/*.md` 是注入 system prompt 的工具说明，修改后立即生效
-- `charts/` 目录运行时自动创建，无需手动建
-- Pydantic 警告（Python 3.14 兼容性）不影响运行，忽略即可
+- `tools.py` 不要修改，工具签名变更会影响 LangGraph 节点绑定
+- `graph.py` 是核心，修改后需重启 Streamlit（cache_resource 会失效）
+- `skills/*.md` 修改后立即生效（注入 system prompt，非 graph 节点）
