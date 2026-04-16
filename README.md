@@ -49,17 +49,20 @@ TAVILY_API_KEY=your_tavily_api_key
 ```
 用户提问
    ↓
-parse_node（openai/gpt-oss-120b via Groq）
+parse_node（LLaMA via Groq）
   └─ 分析问题，生成调度计划（JSON）
    ↓ 条件路由（并行）
-   ├─ data_node   → yfinance 股价 + 走势图
-   ├─ news_node   → Tavily 新闻搜索（自动追加当前年份）
-   └─ rag_node    → ChromaDB 财报检索
-   ↓ fan-in（等待所有节点完成）
+   ├─ data_node   → yfinance 获取数据 → LLaMA 技术面分析
+   ├─ news_node   → Tavily 搜索新闻  → LLaMA 新闻摘要+情绪判断
+   └─ rag_node    → ChromaDB 检索财报 → LLaMA 财务指标提取
+   ↓ fan-in（等待所有节点完成，每个节点输出已预分析的结论）
 report_node
   ├─ 运行模式：Gemini 2.5 Flash（失败时 fallback → Groq）
   └─ 开发模式：openai/gpt-oss-120b via Groq
 ```
+
+每个中间节点都是真正的 Agent：先调用工具拿到原始数据，再用 LLM 做领域分析，
+`report_node` 接收的是各 Agent 的预分析结论，而不是裸数据。
 
 ### AgentState 关键字段
 
@@ -96,12 +99,27 @@ def route_to_agents(state):
 
 ---
 
+## 模型配置
+
+所有节点的模型在 `graph.py` 顶部集中配置，改一行即可切换，无需改动节点代码：
+
+```python
+FAST_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct"
+QUALITY_MODEL = "openai/gpt-oss-120b"
+
+PARSE_MODEL       = FAST_MODEL     # parse_node
+DATA_AGENT_MODEL  = FAST_MODEL     # data_node
+NEWS_AGENT_MODEL  = FAST_MODEL     # news_node
+RAG_AGENT_MODEL   = FAST_MODEL     # rag_node
+REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node（Groq 路径）
+```
+
 ## 双模式运行
 
-| 模式 | parse_node | report_node |
-|------|-----------|-------------|
-| 开发模式（dev_mode=True） | openai/gpt-oss-120b | openai/gpt-oss-120b |
-| 运行模式（dev_mode=False） | openai/gpt-oss-120b | Gemini 2.5 Flash → Groq fallback |
+| 模式 | parse/data/news/rag | report_node |
+|------|---------------------|-------------|
+| 开发模式（dev_mode=True） | LLaMA（fast） | openai/gpt-oss-120b |
+| 运行模式（dev_mode=False） | LLaMA（fast） | Gemini 2.5 Flash → Groq fallback |
 
 切换：侧边栏「🛠️ 开发模式」toggle
 
