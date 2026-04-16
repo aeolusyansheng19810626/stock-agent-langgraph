@@ -107,10 +107,10 @@ def route_to_agents(state):
 FAST_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct"
 QUALITY_MODEL = "openai/gpt-oss-120b"
 
-PARSE_MODEL       = FAST_MODEL     # parse_node
+PARSE_MODEL       = QUALITY_MODEL  # parse_node（公司名→ticker 需要世界知识）
 DATA_AGENT_MODEL  = FAST_MODEL     # data_node
 NEWS_AGENT_MODEL  = FAST_MODEL     # news_node
-RAG_AGENT_MODEL   = FAST_MODEL     # rag_node
+RAG_AGENT_MODEL   = QUALITY_MODEL  # rag_node（数字/单位处理要求严格）
 REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node（Groq 路径）
 ```
 
@@ -118,8 +118,8 @@ REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node（Groq 路径）
 
 | 模式 | parse/data/news/rag | report_node |
 |------|---------------------|-------------|
-| 开发模式（dev_mode=True） | LLaMA（fast） | openai/gpt-oss-120b |
-| 运行模式（dev_mode=False） | LLaMA（fast） | Gemini 2.5 Flash → Groq fallback |
+| 开发模式（dev_mode=True） | parse/rag: gpt-oss-120b；data/news: LLaMA | openai/gpt-oss-120b |
+| 运行模式（dev_mode=False） | parse/rag: gpt-oss-120b；data/news: LLaMA | Gemini 2.5 Flash → Groq fallback |
 
 切换：侧边栏「🛠️ 开发模式」toggle
 

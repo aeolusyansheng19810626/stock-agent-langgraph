@@ -24,10 +24,10 @@ FAST_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 QUALITY_MODEL = "openai/gpt-oss-120b"
 
 # ── 各节点模型配置，在这里统一修改，无需改动节点代码 ──────────────────────────
-PARSE_MODEL       = FAST_MODEL     # parse_node:  分类 + 提取 JSON，快速模型足够
+PARSE_MODEL       = QUALITY_MODEL  # parse_node:  需要世界知识（公司名→ticker映射），用高质量模型
 DATA_AGENT_MODEL  = FAST_MODEL     # data_node:   技术面分析
 NEWS_AGENT_MODEL  = FAST_MODEL     # news_node:   新闻摘要
-RAG_AGENT_MODEL   = FAST_MODEL     # rag_node:    财报提取
+RAG_AGENT_MODEL   = QUALITY_MODEL  # rag_node:    财报提取（数字/单位处理要求严格，用高质量模型）
 REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node: Groq 路径（dev_mode 主力 或 Gemini fallback）
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -53,6 +53,12 @@ RAG_AGENT_SYSTEM = """你是一个财报分析师。
 - 关键财务指标（营收、利润、EPS、毛利率等，如有）
 - 同比 / 环比变化趋势（如有）
 - 管理层指引或重要披露（如有）
+
+数字处理规则（严格遵守）：
+- 【必须】保留原文的数字和单位，禁止自行换算（如原文写 $44.1 billion，直接写 $44.1 billion，不要换算成"亿"）
+- 财期标注使用原文的财年表述（如 FY2026 Q1、Q1 FY26），不要替换为日历年季度
+- 禁止对数字做任何四舍五入或估算，原文是多少就是多少
+
 只基于提供的文档内容，不要编造数据，不要废话。"""
 
 PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，输出一个 JSON 调度计划。
@@ -83,7 +89,12 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - 不需要某 agent → 对应 params 置 null
 
 字段要求：
-  - tickers: 标准大写股票代码（AAPL/TSLA/NVDA/MSFT 等），从用户问题中提取
+  - tickers: 正确的股票代码，从用户问题中识别公司名并转换：
+      美股：大写字母（AAPL/TSLA/NVDA/MSFT 等）
+      日股：数字+.T（爱德万测试→6857.T，软银→9984.T，丰田→7203.T，索尼→6758.T）
+      港股：数字+.HK（腾讯→0700.HK，阿里→9988.HK）
+      A股：数字+.SS或.SZ（贵州茅台→600519.SS）
+  - 【必须】根据公司中文名/英文名准确查找对应 ticker，不得猜测或随意填写
   - news/rag query: 英文关键词，包含公司名和具体主题
   - email_params: 用户明确要求发邮件时填写 {"to": "邮箱地址", "subject": "主题"}，否则 null
   - 用户未提供邮箱时 email_params 为 null
@@ -234,12 +245,12 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
     rag_params = plan.get("rag_params") if isinstance(plan.get("rag_params"), dict) else {}
     email_params = plan.get("email_params") if isinstance(plan.get("email_params"), dict) else None
 
-    tickers = [str(ticker).upper() for ticker in data_params.get("tickers", []) if str(ticker).strip()]
+    tickers = [str(ticker).upper() for ticker in (data_params.get("tickers") or []) if str(ticker).strip()]
     if "data" in agents and not tickers:
         tickers = _extract_tickers(user_input)
 
     need_history = bool(data_params.get("need_history", False))
-    periods = [str(period) for period in data_params.get("periods", []) if str(period).strip()]
+    periods = [str(period) for period in (data_params.get("periods") or []) if str(period).strip()]
     if tickers and len(periods) < len(tickers):
         periods.extend(["6mo"] * (len(tickers) - len(periods)))
 
