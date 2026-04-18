@@ -74,7 +74,8 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "news_params": {"query": "Apple latest news 2025"},
   "rag_params": {"query": "Apple revenue earnings Q4"},
   "email_params": null,
-  "use_financial_report": false
+  "use_financial_report": false,
+  "pdf_path": null
 }
 
 agents 字段从以下选择（可多选）：data / news / rag / email
@@ -102,6 +103,7 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - email_params: 用户明确要求发邮件时填写 {"to": "邮箱地址", "subject": "主题"}，否则 null
   - 用户未提供邮箱时 email_params 为 null
   - 用户提到"财报"、"年报"、"10-K"、"20-F"、"上传PDF"、"读财报"或提供文件路径时 → use_financial_report: true
+  - 用户提供了文件路径（如 "tmp/xxx.pdf"、"path/to/file.pdf"）→ 提取到 pdf_path 字段
   - use_financial_report 为 true 时，仍需正常填写其他 agents 字段
 """
 
@@ -236,6 +238,12 @@ def _extract_tickers(text: str) -> List[str]:
     return seen
 
 
+def _extract_pdf_path(text: str) -> Optional[str]:
+    """Extract a file path ending in .pdf from user input."""
+    match = re.search(r'[\w./\\-]+\.pdf', text, re.IGNORECASE)
+    return match.group() if match else None
+
+
 def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
     text = user_input.lower()
     tickers = _extract_tickers(user_input)
@@ -285,6 +293,7 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
         "rag_params": {"query": user_input} if need_rag else None,
         "email_params": None,
         "use_financial_report": use_financial_report,
+        "pdf_path": _extract_pdf_path(user_input),
     }
 
 
@@ -387,6 +396,7 @@ def parse_node(state: AgentState) -> dict:
         "rag_query": rag_params.get("query", ""),
         "email_params": plan.get("email_params"),
         "use_financial_report": bool(plan.get("use_financial_report", False)),
+        "pdf_path": plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
         "errors": [],
     }
 
@@ -662,6 +672,20 @@ def report_node(state: AgentState) -> dict:
     gemini_exhausted = state.get("gemini_exhausted", False)
 
     parts = []
+    if state.get("financial_metrics"):
+        fm = state["financial_metrics"]
+        risk_lines = "\n".join(f"- {r}" for r in (state.get("risk_signals") or []))
+        citations = state.get("report_citations") or []
+        cit_lines = "\n".join(
+            f'- [chunk {c.get("chunk_id","?")}] {c.get("text","")}'
+            for c in citations[:5]
+        )
+        fm_section = f"[精读财报指标]\n{json.dumps(fm, ensure_ascii=False, indent=2)}"
+        if risk_lines:
+            fm_section += f"\n[风险信号]\n{risk_lines}"
+        if cit_lines:
+            fm_section += f"\n[关键引用]\n{cit_lines}"
+        parts.append(fm_section)
     if state.get("stock_data"):
         parts.append(state["stock_data"])
     if state.get("news"):
