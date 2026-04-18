@@ -68,9 +68,9 @@ TIER_DEBUG     = "llama-3.1-8b-instant"
 - `parse_node`：QUALITY_CASCADE（从 TOP 开始降级）
 - `data_node` / `news_node`：固定 TIER_LOW
 - `scoring_node`：QUALITY_CASCADE（全档降级）
-- `risk_node` / `comparison_node` / `reflection_node`：[TIER_TOP]（单档，不降级）
+- `risk_node` / `comparison_node` / `reflection_node`：[TIER_TOP, TIER_UPPER_MID, TIER_MID]（限速时降级）
 - `hypothesis_node`：[TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW]（部分降级）
-- `deep_read_node`：S1 QUALITY_CASCADE，S2 [TIER_TOP, TIER_UPPER_MID, TIER_MID]
+- `deep_read_node`：S1 [TIER_MID, TIER_LOW, TIER_DEBUG]，S2 [TIER_TOP, TIER_UPPER_MID, TIER_MID]
 - `report_node`：Gemini 优先，失败 fallback Groq QUALITY_CASCADE
 
 ## 开发规范

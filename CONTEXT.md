@@ -53,11 +53,11 @@ START → parse_node
 | news_node | need_news=True | TIER_LOW |
 | rag_node | need_rag=True | QUALITY_CASCADE |
 | scoring_node | need_scoring=True | QUALITY_CASCADE |
-| risk_node | need_risk=True | TIER_TOP |
-| comparison_node | need_comparison=True | TIER_TOP |
+| risk_node | need_risk=True | [TOP,UPPER_MID,MID] |
+| comparison_node | need_comparison=True | [TOP,UPPER_MID,MID] |
 | hypothesis_node | need_hypothesis=True | TIER_TOP |
-| reflection_node | need_reflection=True | TIER_TOP |
-| deep_read_node | need_deep_read=True | S1:QUALITY_CASCADE / S2:[TOP,UPPER_MID,MID] |
+| reflection_node | need_reflection=True | [TOP,UPPER_MID,MID] |
+| deep_read_node | need_deep_read=True | S1:[MID,LOW,DEBUG] / S2:[TOP,UPPER_MID,MID] |
 | report_node | 每次必跑 | Gemini → Groq fallback |
 
 ---

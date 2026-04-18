@@ -39,6 +39,13 @@ RATE_LIMIT_KEYWORDS = ("429", "rate_limit", "rate limit", "503", "over_capacity"
 DATA_AGENT_MODEL = TIER_LOW
 NEWS_AGENT_MODEL = TIER_LOW
 
+# 各节点专用 cascade（替代固定单模型，兼顾质量与限速容错）
+RISK_MODEL_CASCADE       = [TIER_TOP, TIER_UPPER_MID, TIER_MID]
+COMPARISON_MODEL_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID]
+REFLECTION_MODEL_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID]
+DEEP_READ_S1_CASCADE     = [TIER_MID, TIER_LOW, TIER_DEBUG]   # 提取为主，不需要强模型
+DEEP_READ_S2_CASCADE     = [TIER_TOP, TIER_UPPER_MID, TIER_MID]  # 批判推理，保持高质量
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 DATA_AGENT_SYSTEM = """你是一个股票技术面分析助手。
@@ -71,16 +78,13 @@ RAG_AGENT_SYSTEM = """你是一个财报分析师。
 
 只基于提供的文档内容，不要编造数据，不要废话。"""
 
-PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，输出一个 JSON 调度计划。
+PLAN_SYSTEM = """股票分析任务调度器。严格输出纯 JSON，禁止任何其他文字。
 
-严格输出纯 JSON，不要 markdown 代码块，不要任何解释文字。
-
-格式：
 {
-  "agents": ["data"],
+  "agents": ["data"|"news"|"rag"|"email"],
   "data_params": {"tickers": ["AAPL"], "need_history": false, "periods": ["6mo"]},
-  "news_params": {"query": "Apple latest news 2025"},
-  "rag_params": {"query": "Apple revenue earnings Q4"},
+  "news_params": {"query": "Apple news 2026"},
+  "rag_params": {"query": "Apple revenue Q4"},
   "email_params": null,
   "need_scoring": false,
   "need_risk": false,
@@ -93,55 +97,27 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "pdf_path": null
 }
 
-agents 字段从以下选择（可多选）：data / news / rag / email
-  data  → 查询股价、涨跌、估值、走势图
-  news  → 查询新闻、近期动态、催化剂、市场消息
-  rag   → 查询财报、营收、利润、EPS、毛利率、季报、年报
-  email → 用户明确要求发送邮件报告
+agents 选择规则：
+  data → 股价/走势/估值  news → 新闻/动态  rag → 财报/营收/利润  email → 明确要求发邮件
+  综合分析 → ["data","news","rag"]  单一问题 → 单个agent
 
-路由规则（严格遵守）：
-  - 只问股价/走势  → agents: ["data"]
-  - 只问新闻      → agents: ["news"]
-  - 只问财报      → agents: ["rag"]
-  - 综合分析      → agents: ["data", "news", "rag"]
-  - 需要走势图    → need_history: true
-  - 不需要某 agent → 对应 params 置 null
+tickers 转换规则：
+  美股：AAPL/TSLA/NVDA/MSFT  日股：数字.T（丰田→7203.T）  港股：数字.HK（腾讯→0700.HK）  A股：数字.SS/.SZ
 
-字段要求：
-  - tickers: 正确的股票代码，从用户问题中识别公司名并转换：
-      美股：大写字母（AAPL/TSLA/NVDA/MSFT 等）
-      日股：数字+.T（爱德万测试→6857.T，软银→9984.T，丰田→7203.T，索尼→6758.T）
-      港股：数字+.HK（腾讯→0700.HK，阿里→9988.HK）
-      A股：数字+.SS或.SZ（贵州茅台→600519.SS）
-  - 【必须】根据公司中文名/英文名准确查找对应 ticker，不得猜测或随意填写
-  - news/rag query: 英文关键词，包含公司名和具体主题
-  - email_params: 用户明确要求发邮件时填写 {"to": "邮箱地址", "subject": "主题"}，否则 null
-  - 用户未提供邮箱时 email_params 为 null
-  - 用户提到"财报"、"年报"、"10-K"、"20-F"、"上传PDF"、"读财报"或提供文件路径时 → use_financial_report: true
-  - 用户提供了文件路径（如 "tmp/xxx.pdf"、"path/to/file.pdf"）→ 提取到 pdf_path 字段
-  - use_financial_report 为 true 时，仍需正常填写其他 agents 字段
-  - need_scoring 规则：
-      true  → 用户要求综合分析、投资建议、买卖评级、值不值得买等
-      false → 只查股价、只查新闻、只查某项数据等单一问题
-  - need_risk 规则：
-      true  → 用户问到"风险"、"隐患"、"担忧"、"有什么问题"、"risk"
-      false → 未询问风险相关内容
-  - need_comparison 规则：
-      true  → 用户输入2个以上股票代码，或出现"对比"、"比较"、"PK"、"哪个更好"、"compare"
-      false → 未询问对比相关内容且股票代码少于2个
-  - need_hypothesis 规则：
-      true  → 用户出现"如果"、"假设"、"若"、"what if"、"假如"、"倘若"等引导假设性问题的关键词
-      false → 询问事实、数据或当前状态，不涉及假设推演
-  - need_deep_read 规则：
-      true  → 用户出现"精读"、"深度分析"、"质疑"、"批判"、"论文"、"研究报告"
-      false → 默认
-  - comparison_dimensions:
-      从用户输入中提取指定维度，如 ["估值", "技术面", "新闻情绪"]
-      用户未指定维度时输出 []，代表全维度对比
-  - need_reflection 规则：
-      true  → 用户要求"深度分析"、"详细"、"严谨"、"全面"
-      true  → need_scoring=true 时同步开启
-      false → 简单查价、简单新闻、单项数据查询
+布尔字段规则（true 条件）：
+  need_scoring     → 综合分析/投资建议/买卖评级
+  need_risk        → 风险/隐患/担忧/risk
+  need_comparison  → 2个以上ticker/对比/比较/PK/compare
+  need_hypothesis  → 如果/假设/若/what if/假如
+  need_deep_read   → 精读/质疑/批判/论文
+  need_reflection  → 深度/严谨/全面 或 need_scoring=true
+  use_financial_report → 财报/年报/10-K/20-F/PDF路径
+
+其他：
+  pdf_path → 从输入提取 .pdf 路径
+  comparison_dimensions → 用户指定维度，否则 []
+  不需要的 agent 对应 params 置 null
+  use_financial_report=true 时，仍需正常填写其他 agents 字段
 """
 
 DEEP_READ_STAGE1_SYSTEM = """你是一个专业文档分析师。
@@ -370,7 +346,7 @@ def deep_read_node(state: AgentState) -> dict:
                 HumanMessage(content=f"内容：\n{context}")
             ],
             api_key,
-            QUALITY_CASCADE
+            DEEP_READ_S1_CASCADE
         )
         s1_result = _parse_json_from_text(raw1)
     except Exception as exc:
@@ -387,7 +363,7 @@ def deep_read_node(state: AgentState) -> dict:
                     HumanMessage(content=f"核心内容：\n{json.dumps(s1_result, ensure_ascii=False)}")
                 ],
                 api_key,
-                [TIER_TOP, TIER_UPPER_MID, TIER_MID]
+                DEEP_READ_S2_CASCADE
             )
             s2_result = _parse_json_from_text(raw2)
         except Exception as exc:
@@ -1047,7 +1023,7 @@ def risk_node(state: AgentState) -> dict:
         raw, risk_model = _invoke_with_cascade(
             [SystemMessage(content=RISK_SYSTEM), HumanMessage(content=f"请分析以下数据中的风险：\n\n{context}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            [TIER_TOP],
+            RISK_MODEL_CASCADE,
         )
         raw = raw.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
@@ -1117,7 +1093,7 @@ def comparison_node(state: AgentState) -> dict:
         raw, comparison_model = _invoke_with_cascade(
             [SystemMessage(content=COMPARISON_SYSTEM), HumanMessage(content=f"请对以下股票进行逐项对比：\n\n{context}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            [TIER_TOP],
+            COMPARISON_MODEL_CASCADE,
         )
         raw = raw.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
@@ -1588,7 +1564,7 @@ def reflection_node(state: AgentState) -> dict:
         raw, reflection_model = _invoke_with_cascade(
             [SystemMessage(content=REFLECTION_SYSTEM), HumanMessage(content=f"股票分析报告：\n\n{report}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            [TIER_TOP],
+            REFLECTION_MODEL_CASCADE,
         )
         parsed = _parse_json_from_text(raw)
         if not parsed:
