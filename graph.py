@@ -1692,7 +1692,7 @@ def build_graph():
     builder.add_edge("rag_node", "reflection_node")
 
     # 所有分析节点汇入 report_node
-    builder.add_edge(["scoring_node", "risk_node", "comparison_node", "hypothesis_node", "deep_read_node", "reflection_node"], "report_node")
+    builder.add_edge(["scoring_node", "risk_node", "comparison_node", "hypothesis_node", "reflection_node"], "report_node")
 
     builder.add_edge("report_node", END)
 
