@@ -50,7 +50,7 @@ TAVILY_API_KEY=your_tavily_api_key
 用户提问
    ↓
 parse_node（QUALITY_CASCADE）
-  └─ 分析问题，生成调度计划（JSON），含 need_scoring / need_risk 判断
+  └─ 分析问题，生成调度计划（JSON），含 need_scoring / need_risk / need_comparison 判断
    ↓ 条件路由
    ├─ [条件] financial_report_node → pdfplumber Map + QUALITY_CASCADE Reduce
    ↓ 条件路由（并行）
@@ -62,11 +62,13 @@ parse_node（QUALITY_CASCADE）
   └─ need_scoring=true 时才触发，Chain-of-Thought 多维度评分
 [条件并行] risk_node（gpt-oss-120b）
   └─ need_risk=true 时才触发，输出结构化风险矩阵
+[条件并行] comparison_node（gpt-oss-120b）
+  └─ need_comparison=true 时才触发，输出对比排名、胜出方和逐维度对比表
    ↓
 report_node
   ├─ 运行模式：Gemini 2.5 Flash（失败时 fallback → Groq QUALITY_CASCADE）
   ├─ 开发模式：Groq QUALITY_CASCADE
-  └─ 如有 risk_result，在报告末尾追加「风险矩阵」章节
+  └─ 如有 comparison_result / risk_result，在报告中追加对比表格和风险矩阵章节
 ```
 
 每个中间节点都是真正的 Agent：先调用工具拿到原始数据，再用 LLM 做领域分析，
@@ -82,12 +84,15 @@ class AgentState(TypedDict):
     need_data: bool; need_news: bool; need_rag: bool; need_history: bool
     need_scoring: bool          # 是否需要多维度评分（综合分析=True，简单查价=False）
     need_risk: bool             # 是否需要风险矩阵（风险/隐患/担忧/risk=True）
+    need_comparison: bool       # 是否需要多股票对比
+    comparison_dimensions: List[str]  # 指定对比维度，空列表代表全维度
     use_financial_report: bool  # 是否触发 financial_report_node
     pdf_path: Optional[str]
     financial_metrics: Optional[dict]; risk_signals: Optional[list]; report_citations: Optional[list]
     stock_data: str; news: str; rag_result: str
     scoring_result: dict  # scoring_node 输出的多维度评分 JSON
     risk_result: Optional[dict]  # risk_node 输出的结构化风险矩阵 JSON
+    comparison_result: Optional[dict]  # comparison_node 输出的排名和对比表 JSON
     report: str; email_status: str; final_model: str
     gemini_exhausted: bool
     tool_calls: Annotated[List[dict], operator.add]  # 并行节点自动合并
@@ -132,12 +137,13 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 |------|------|
 | parse / rag / scoring / report(Groq) / financial_report Reduce | QUALITY_CASCADE（上→下依次降级） |
 | risk | TIER_TOP（openai/gpt-oss-120b，结构化风险矩阵） |
+| comparison | TIER_TOP（openai/gpt-oss-120b，结构化对比排名和表格） |
 | data / news / financial_report Map | TIER_LOW 直接调用，不级联 |
 
 ## 双模式运行
 
-| 模式 | parse/rag/scoring | risk | data/news | report_node |
-|------|-------------------|------|-----------|-------------|
+| 模式 | parse/rag/scoring | risk/comparison | data/news | report_node |
+|------|-------------------|-----------------|-----------|-------------|
 | 开发模式（dev_mode=True） | QUALITY_CASCADE | gpt-oss-120b | LLaMA | Groq QUALITY_CASCADE |
 | 运行模式（dev_mode=False） | QUALITY_CASCADE | gpt-oss-120b | LLaMA | Gemini 2.5 Flash → Groq fallback |
 

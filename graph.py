@@ -83,6 +83,8 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "email_params": null,
   "need_scoring": false,
   "need_risk": false,
+  "need_comparison": false,
+  "comparison_dimensions": [],
   "use_financial_report": false,
   "pdf_path": null
 }
@@ -120,6 +122,12 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - need_risk 规则：
       true  → 用户问到"风险"、"隐患"、"担忧"、"有什么问题"、"risk"
       false → 未询问风险相关内容
+  - need_comparison 规则：
+      true  → 用户输入2个以上股票代码，或出现"对比"、"比较"、"PK"、"哪个更好"、"compare"
+      false → 未询问对比相关内容且股票代码少于2个
+  - comparison_dimensions:
+      从用户输入中提取指定维度，如 ["估值", "技术面", "新闻情绪"]
+      用户未指定维度时输出 []，代表全维度对比
 """
 
 SCORING_SYSTEM = """你是一名资深股票分析师，专注于综合量化评分。你将收到一支股票的技术面数据、新闻情绪和财报信息。
@@ -157,6 +165,25 @@ Step 4 综合推理（overall_reasoning / final_rating / confidence）：
   "confidence": <0-100>,
   "uncertainty_factors": ["<因素1>", "<因素2>"],
   "overall_reasoning": "<综合推理说明>"
+}"""
+
+COMPARISON_SYSTEM = """你是一名股票对比分析师。你会收到多只股票的行情/技术面数据和新闻信息。
+
+请对以下股票按用户指定维度逐项对比，输出纯 JSON，禁止输出任何其他文字。
+
+输出格式：
+{
+  "dimensions": ["估值", "技术面", "新闻情绪"],
+  "rankings": [
+    {"rank": 1, "ticker": "AAPL", "score": 8.2, "summary": "..."},
+    {"rank": 2, "ticker": "MSFT", "score": 7.5, "summary": "..."}
+  ],
+  "comparison_table": {
+    "估值": {"AAPL": "PE 28，略高", "MSFT": "PE 26，合理"},
+    "技术面": {"AAPL": "...", "MSFT": "..."}
+  },
+  "winner": "AAPL",
+  "winner_reasoning": "综合来看..."
 }"""
 
 RISK_SYSTEM = """你是一名股票风险分析师。你将收到一支股票的财务指标、技术面数据和新闻信息。
@@ -209,6 +236,8 @@ class AgentState(TypedDict):
 
     need_scoring: bool
     need_risk: bool
+    need_comparison: bool
+    comparison_dimensions: List[str]
     pdf_path: Optional[str]
     use_financial_report: bool
     financial_metrics: Optional[dict]
@@ -223,6 +252,7 @@ class AgentState(TypedDict):
     rag_result: str
     scoring_result: dict
     risk_result: Optional[dict]
+    comparison_result: Optional[dict]
 
     report: str
     email_status: str
@@ -297,9 +327,29 @@ def _extract_pdf_path(text: str) -> Optional[str]:
     return match.group() if match else None
 
 
+def _extract_comparison_dimensions(text: str) -> List[str]:
+    dimension_keywords = [
+        ("估值", ("估值", "pe", "pb", "valuation")),
+        ("技术面", ("技术面", "走势", "趋势", "chart", "technical")),
+        ("新闻情绪", ("新闻情绪", "情绪", "新闻", "消息", "news", "sentiment")),
+        ("财务", ("财务", "财报", "营收", "利润", "earnings", "financial")),
+        ("风险", ("风险", "隐患", "担忧", "risk")),
+    ]
+    lowered = text.lower()
+    dimensions = []
+    for dimension, keywords in dimension_keywords:
+        if any(keyword in lowered for keyword in keywords):
+            dimensions.append(dimension)
+    return dimensions
+
+
 def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
     text = user_input.lower()
     tickers = _extract_tickers(user_input)
+    comparison_dimensions = _extract_comparison_dimensions(user_input)
+    need_comparison = len(tickers) >= 2 or any(
+        kw in text for kw in ("对比", "比较", "pk", "哪个更好", "compare")
+    )
 
     need_data = bool(tickers) or any(
         kw in text for kw in ("price", "quote", "valuation", "market cap", "stock", "ticker")
@@ -317,6 +367,10 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
 
     if need_history:
         need_data = True
+    if need_comparison and tickers:
+        need_data = True
+        if not comparison_dimensions or "新闻情绪" in comparison_dimensions:
+            need_news = True
 
     agents = []
     if need_data:
@@ -353,6 +407,8 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
         "email_params": None,
         "need_scoring": need_scoring,
         "need_risk": need_risk,
+        "need_comparison": need_comparison,
+        "comparison_dimensions": comparison_dimensions,
         "use_financial_report": use_financial_report,
         "pdf_path": _extract_pdf_path(user_input),
     }
@@ -403,6 +459,19 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
     need_risk = bool(plan.get("need_risk", False)) or any(
         kw in user_input.lower() for kw in ("风险", "隐患", "担忧", "有什么问题", "risk")
     )
+    comparison_dimensions = [
+        str(item) for item in (plan.get("comparison_dimensions") or []) if str(item).strip()
+    ] or _extract_comparison_dimensions(user_input)
+    need_comparison = bool(plan.get("need_comparison", False)) or len(tickers) >= 2 or any(
+        kw in user_input.lower() for kw in ("对比", "比较", "pk", "哪个更好", "compare")
+    )
+
+    if need_comparison and tickers and "data" not in agents:
+        agents.append("data")
+    if need_comparison and tickers and ("新闻情绪" in comparison_dimensions or not comparison_dimensions) and "news" not in agents:
+        agents.append("news")
+        if not news_query:
+            news_query = user_input
 
     if not agents:
         return _infer_plan_from_text(user_input, rag_available)
@@ -419,6 +488,8 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         "email_params": email_params,
         "need_scoring": need_scoring,
         "need_risk": need_risk,
+        "need_comparison": need_comparison,
+        "comparison_dimensions": comparison_dimensions,
         "use_financial_report": use_financial_report,
     }
 
@@ -461,6 +532,8 @@ def parse_node(state: AgentState) -> dict:
         "email_params": plan.get("email_params"),
         "need_scoring": bool(plan.get("need_scoring", False)),
         "need_risk": bool(plan.get("need_risk", False)),
+        "need_comparison": bool(plan.get("need_comparison", False)),
+        "comparison_dimensions": plan.get("comparison_dimensions", []),
         "use_financial_report": bool(plan.get("use_financial_report", False)),
         "pdf_path": plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
         "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": model_used}}],
@@ -798,6 +871,132 @@ def risk_node(state: AgentState) -> dict:
     return {"risk_result": risk_result, "tool_calls": tool_calls, "errors": errors}
 
 
+def comparison_node(state: AgentState) -> dict:
+    if not state.get("need_comparison"):
+        return {"comparison_result": {}, "tool_calls": [], "errors": []}
+
+    parts = []
+    if state.get("tickers"):
+        parts.append("[股票列表]\n" + ", ".join(state.get("tickers") or []))
+    if state.get("comparison_dimensions"):
+        parts.append("[指定维度]\n" + json.dumps(state.get("comparison_dimensions"), ensure_ascii=False))
+    else:
+        parts.append("[指定维度]\n[]（代表全维度）")
+    if state.get("stock_data"):
+        parts.append(f"[行情与技术面数据]\n{state['stock_data']}")
+    if state.get("news"):
+        parts.append(f"[新闻信息]\n{state['news']}")
+
+    if not state.get("stock_data") and not state.get("news"):
+        return {"comparison_result": {}, "tool_calls": [], "errors": []}
+
+    context = "\n\n".join(parts)
+    errors = []
+    comparison_result = {}
+    comparison_model = TIER_TOP
+
+    try:
+        raw, comparison_model = _invoke_with_cascade(
+            [SystemMessage(content=COMPARISON_SYSTEM), HumanMessage(content=f"请对以下股票进行逐项对比：\n\n{context}")],
+            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            [TIER_TOP],
+        )
+        raw = raw.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+
+        try:
+            comparison_result = json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                try:
+                    comparison_result = json.loads(match.group())
+                except Exception as parse_exc:
+                    errors.append({
+                        "node": "comparison_node",
+                        "tool": "json_parse",
+                        "message": str(parse_exc),
+                        "retryable": False,
+                    })
+            else:
+                errors.append({
+                    "node": "comparison_node",
+                    "tool": "json_parse",
+                    "message": f"No JSON found in response: {raw[:200]}",
+                    "retryable": False,
+                })
+    except Exception as exc:
+        errors.append({
+            "node": "comparison_node",
+            "tool": "llm_comparison",
+            "message": str(exc),
+            "retryable": False,
+        })
+
+    tool_calls = (
+        [{"tool_name": "llm", "tool_args": {"node": "comparison", "model": comparison_model}}]
+        if comparison_result else []
+    )
+    return {"comparison_result": comparison_result, "tool_calls": tool_calls, "errors": errors}
+
+
+def _format_comparison_section(comparison_result: Optional[dict]) -> str:
+    if not comparison_result:
+        return ""
+
+    rankings = comparison_result.get("rankings") or []
+    table = comparison_result.get("comparison_table") or {}
+    if not rankings and not table:
+        return ""
+
+    lines = ["", "## 对比排名与表格", ""]
+
+    if rankings:
+        lines.extend([
+            "### 综合排名",
+            "",
+            "| 排名 | 股票 | 分数 | 摘要 |",
+            "|---:|---|---:|---|",
+        ])
+        for item in rankings:
+            rank = item.get("rank", "")
+            ticker = str(item.get("ticker", "")).replace("|", "/")
+            score = item.get("score", "")
+            summary = str(item.get("summary", "")).replace("|", "/")
+            lines.append(f"| {rank} | {ticker} | {score} | {summary} |")
+
+    winner = str(comparison_result.get("winner", "")).strip()
+    winner_reasoning = str(comparison_result.get("winner_reasoning", "")).strip()
+    if winner or winner_reasoning:
+        lines.extend(["", f"**胜出方：** {winner or 'N/A'}"])
+        if winner_reasoning:
+            lines.append(f"**胜出理由：** {winner_reasoning}")
+
+    if table:
+        tickers = []
+        for values in table.values():
+            if isinstance(values, dict):
+                for ticker in values:
+                    if ticker not in tickers:
+                        tickers.append(ticker)
+
+        if tickers:
+            lines.extend(["", "### 维度对比", ""])
+            header = "| 维度 | " + " | ".join(str(ticker).replace("|", "/") for ticker in tickers) + " |"
+            separator = "|---" + "|---" * len(tickers) + "|"
+            lines.extend([header, separator])
+            for dimension, values in table.items():
+                if not isinstance(values, dict):
+                    continue
+                row = [str(dimension).replace("|", "/")]
+                for ticker in tickers:
+                    row.append(str(values.get(ticker, "")).replace("|", "/"))
+                lines.append("| " + " | ".join(row) + " |")
+
+    return "\n".join(lines)
+
+
 def _format_risk_matrix(risk_result: Optional[dict]) -> str:
     if not risk_result:
         return ""
@@ -953,6 +1152,10 @@ def report_node(state: AgentState) -> dict:
         if response is None:
             response, final_model = call_groq()
 
+    comparison_section = _format_comparison_section(state.get("comparison_result"))
+    if comparison_section:
+        response = f"{response.rstrip()}\n\n{comparison_section}"
+
     risk_matrix = _format_risk_matrix(state.get("risk_result"))
     if risk_matrix:
         response = f"{response.rstrip()}\n\n{risk_matrix}"
@@ -1026,6 +1229,7 @@ def build_graph():
     builder.add_node("rag_node", rag_node)
     builder.add_node("scoring_node", scoring_node)
     builder.add_node("risk_node", risk_node)
+    builder.add_node("comparison_node", comparison_node)
     builder.add_node("report_node", report_node)
 
     builder.add_edge(START, "parse_node")
@@ -1039,7 +1243,7 @@ def build_graph():
     builder.add_conditional_edges(
         "parse_node",
         route_after_parse,
-        ["financial_report_node", "data_node", "news_node", "rag_node", "scoring_node", "risk_node", "report_node"],
+        ["financial_report_node", "data_node", "news_node", "rag_node", "scoring_node", "risk_node", "comparison_node", "report_node"],
     )
 
     # financial_report_node 完成后进并行节点
@@ -1050,17 +1254,20 @@ def build_graph():
     builder.add_conditional_edges(
         "financial_report_node",
         route_after_financial,
-        ["data_node", "news_node", "rag_node", "scoring_node", "risk_node"],
+        ["data_node", "news_node", "rag_node", "scoring_node", "risk_node", "comparison_node"],
     )
 
-    # 并行节点完成后同时进入 scoring/risk；report_node 等两个分析节点都完成。
+    # 并行节点完成后同时进入 scoring/risk/comparison；report_node 等分析节点都完成。
     builder.add_edge("data_node", "scoring_node")
     builder.add_edge("news_node", "scoring_node")
     builder.add_edge("rag_node", "scoring_node")
     builder.add_edge("data_node", "risk_node")
     builder.add_edge("news_node", "risk_node")
     builder.add_edge("rag_node", "risk_node")
-    builder.add_edge(["scoring_node", "risk_node"], "report_node")
+    builder.add_edge("data_node", "comparison_node")
+    builder.add_edge("news_node", "comparison_node")
+    builder.add_edge("rag_node", "comparison_node")
+    builder.add_edge(["scoring_node", "risk_node", "comparison_node"], "report_node")
     builder.add_edge("report_node", END)
 
     return builder.compile()
@@ -1078,8 +1285,13 @@ def _parallel_targets(state: AgentState) -> list:
 
 
 def _analysis_targets(state: AgentState) -> list:
-    if state.get("need_scoring") or state.get("need_risk") or state.get("use_financial_report"):
-        return ["scoring_node", "risk_node"]
+    if (
+        state.get("need_scoring")
+        or state.get("need_risk")
+        or state.get("need_comparison")
+        or state.get("use_financial_report")
+    ):
+        return ["scoring_node", "risk_node", "comparison_node"]
     return []
 
 
