@@ -1439,6 +1439,9 @@ def report_node(state: AgentState) -> dict:
     if dev_mode or gemini_exhausted:
         try:
             response, final_model = call_groq()
+            if not response.strip():
+                response = "⚠️ 报告生成失败：模型返回空响应，请重试。"
+                final_model = "none"
         except Exception as exc:
             response = f"⚠️ 报告生成失败，所有 Groq 模型均不可用：{exc}"
             final_model = "none"
