@@ -58,6 +58,8 @@ parse_node（QUALITY_CASCADE）
    ├─ [条件] news_node   → Tavily 搜索新闻    → LLaMA 新闻摘要+情绪判断
    └─ [条件] rag_node    → ChromaDB 检索财报  → QUALITY_CASCADE 财务指标提取
    ↓ fan-in
+[条件并行] deep_read_node（QUALITY_CASCADE）
+  └─ need_deep_read=true 时触发，双阶段：1.摘要提取；2.质疑分析
 [条件并行] scoring_node（QUALITY_CASCADE）
   └─ need_scoring=true 时才触发，Chain-of-Thought 多维度评分
 [条件并行] risk_node（gpt-oss-120b）
@@ -88,6 +90,7 @@ class AgentState(TypedDict):
     tickers: List[str]
     need_data: bool; need_news: bool; need_rag: bool; need_history: bool
     need_scoring: bool          # 是否需要多维度评分（综合分析=True，简单查价=False）
+    need_deep_read: bool        # 是否需要精读批判（精读/深度分析/质疑/论文/研究报告=True）
     need_risk: bool             # 是否需要风险矩阵（风险/隐患/担忧/risk=True）
     need_comparison: bool       # 是否需要多股票对比
     need_hypothesis: bool       # 是否需要假设推演（如果/假设/what if=True）
@@ -97,6 +100,7 @@ class AgentState(TypedDict):
     pdf_path: Optional[str]
     financial_metrics: Optional[dict]; risk_signals: Optional[list]; report_citations: Optional[list]
     stock_data: str; news: str; rag_result: str
+    deep_read_result: Optional[dict]  # deep_read_node 输出的摘要与批判 JSON
     scoring_result: dict  # scoring_node 输出的多维度评分 JSON
     risk_result: Optional[dict]  # risk_node 输出的结构化风险矩阵 JSON
     comparison_result: Optional[dict]  # comparison_node 输出的排名和对比表 JSON

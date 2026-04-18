@@ -86,6 +86,7 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "need_risk": false,
   "need_comparison": false,
   "need_hypothesis": false,
+  "need_deep_read": false,
   "comparison_dimensions": [],
   "need_reflection": false,
   "use_financial_report": false,
@@ -131,6 +132,9 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - need_hypothesis 规则：
       true  → 用户出现"如果"、"假设"、"若"、"what if"、"假如"、"倘若"等引导假设性问题的关键词
       false → 询问事实、数据或当前状态，不涉及假设推演
+  - need_deep_read 规则：
+      true  → 用户出现"精读"、"深度分析"、"质疑"、"批判"、"论文"、"研究报告"
+      false → 默认
   - comparison_dimensions:
       从用户输入中提取指定维度，如 ["估值", "技术面", "新闻情绪"]
       用户未指定维度时输出 []，代表全维度对比
@@ -139,6 +143,36 @@ agents 字段从以下选择（可多选）：data / news / rag / email
       true  → need_scoring=true 时同步开启
       false → 简单查价、简单新闻、单项数据查询
 """
+
+DEEP_READ_STAGE1_SYSTEM = """你是一个专业文档分析师。
+基于以下文档内容，提取：
+{
+  "doc_type": "财报|论文|研究报告",
+  "summary": "核心内容100字摘要",
+  "key_metrics": [
+    {"name": "指标名", "value": "数值", "significance": "重要性说明"}
+  ],
+  "key_claims": ["核心论点1", "核心论点2"],
+  "time_period": "时间范围"
+}
+只输出纯 JSON。"""
+
+DEEP_READ_STAGE2_SYSTEM = """你是一个批判性思维专家。
+基于以下文档的核心论点，进行深度质疑：
+{
+  "critical_questions": [
+    {
+      "question": "质疑问题",
+      "basis": "质疑依据",
+      "severity": "高|中|低"
+    }
+  ],
+  "logical_gaps": ["逻辑漏洞1"],
+  "missing_info": ["缺失信息1"],
+  "reliability_score": 0-10,
+  "conclusion": "综合可信度评估"
+}
+只输出纯 JSON。"""
 
 SCORING_SYSTEM = """你是一名资深股票分析师，专注于综合量化评分。你将收到一支股票的技术面数据、新闻情绪和财报信息。
 
@@ -312,6 +346,61 @@ def hypothesis_node(state: AgentState) -> dict:
     return {"hypothesis_result": hypothesis_result, "tool_calls": tool_calls, "errors": errors}
 
 
+def deep_read_node(state: AgentState) -> dict:
+    if not state.get("need_deep_read"):
+        return {"deep_read_result": {}, "tool_calls": [], "errors": []}
+
+    parts = []
+    if state.get("financial_metrics"):
+        parts.append("[财务指标]\n" + json.dumps(state.get("financial_metrics"), ensure_ascii=False, indent=2))
+    if state.get("rag_result"):
+        parts.append(f"[财报数据]\n{state['rag_result']}")
+
+    context = "\n\n".join(parts) if parts else "无背景数据"
+    errors = []
+    api_key = state.get("groq_api_key") or os.getenv("GROQ_API_KEY", "")
+
+    # 阶段 1: 摘要与指标提取
+    s1_result = {}
+    s1_model = QUALITY_CASCADE[0]
+    try:
+        raw1, s1_model = _invoke_with_cascade(
+            [
+                SystemMessage(content=DEEP_READ_STAGE1_SYSTEM),
+                HumanMessage(content=f"内容：\n{context}")
+            ],
+            api_key,
+            QUALITY_CASCADE
+        )
+        s1_result = _parse_json_from_text(raw1)
+    except Exception as exc:
+        errors.append({"node": "deep_read_node", "tool": "s1_llm", "message": str(exc), "retryable": False})
+
+    # 阶段 2: 批判质疑
+    s2_result = {}
+    s2_model = TIER_TOP
+    if s1_result:
+        try:
+            raw2, s2_model = _invoke_with_cascade(
+                [
+                    SystemMessage(content=DEEP_READ_STAGE2_SYSTEM),
+                    HumanMessage(content=f"核心内容：\n{json.dumps(s1_result, ensure_ascii=False)}")
+                ],
+                api_key,
+                [TIER_TOP, TIER_UPPER_MID, TIER_MID]
+            )
+            s2_result = _parse_json_from_text(raw2)
+        except Exception as exc:
+            errors.append({"node": "deep_read_node", "tool": "s2_llm", "message": str(exc), "retryable": False})
+
+    deep_read_result = {**s1_result, **s2_result}
+    tool_calls = []
+    if deep_read_result:
+        tool_calls.append({"tool_name": "llm", "tool_args": {"node": "deep_read", "model": f"S1:{s1_model} S2:{s2_model}"}})
+
+    return {"deep_read_result": deep_read_result, "tool_calls": tool_calls, "errors": errors}
+
+
 class AgentState(TypedDict):
     user_input: str
     chat_history_text: str
@@ -331,6 +420,7 @@ class AgentState(TypedDict):
     need_risk: bool
     need_comparison: bool
     need_hypothesis: bool
+    need_deep_read: bool
     need_reflection: bool
     comparison_dimensions: List[str]
     pdf_path: Optional[str]
@@ -349,6 +439,7 @@ class AgentState(TypedDict):
     risk_result: Optional[dict]
     comparison_result: Optional[dict]
     hypothesis_result: Optional[dict]
+    deep_read_result: Optional[dict]
     reflection_result: Optional[str]
 
     report: str
@@ -492,6 +583,9 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
     need_risk = any(
         kw in text for kw in ("风险", "隐患", "担忧", "有什么问题", "risk")
     )
+    need_deep_read = any(
+        kw in text for kw in ("精读", "深度分析", "质疑", "批判", "论文", "研究报告")
+    )
     # print(f"DEBUG: text='{text}', need_hypothesis={need_hypothesis}") # Remove debug
     # need_hypothesis = True # Force for testing
     need_reflection = need_scoring or any(
@@ -512,6 +606,7 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
         "need_risk": need_risk,
         "need_comparison": need_comparison,
         "need_hypothesis": any(kw in text for kw in ("如果", "假设", "若", "what if", "假如", "倘若")),
+        "need_deep_read": need_deep_read,
         "comparison_dimensions": comparison_dimensions,
         "need_reflection": need_reflection,
         "use_financial_report": use_financial_report,
@@ -567,6 +662,9 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
     need_hypothesis = bool(plan.get("need_hypothesis", False)) or any(
         kw in user_input.lower() for kw in ("如果", "假设", "若", "what if", "假如", "倘若")
     )
+    need_deep_read = bool(plan.get("need_deep_read", False)) or any(
+        kw in user_input.lower() for kw in ("精读", "深度分析", "质疑", "批判", "论文", "研究报告")
+    )
     comparison_dimensions = [
         str(item) for item in (plan.get("comparison_dimensions") or []) if str(item).strip()
     ] or _extract_comparison_dimensions(user_input)
@@ -576,6 +674,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
     need_reflection = (
         bool(plan.get("need_reflection", False))
         or need_scoring
+        or need_deep_read
         or any(kw in user_input.lower() for kw in ("深度分析", "详细", "严谨", "全面"))
     )
 
@@ -603,6 +702,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         "need_risk": need_risk,
         "need_comparison": need_comparison,
         "need_hypothesis": need_hypothesis,
+        "need_deep_read": need_deep_read,
         "comparison_dimensions": comparison_dimensions,
         "need_reflection": need_reflection,
         "use_financial_report": use_financial_report,
@@ -649,6 +749,7 @@ def parse_node(state: AgentState) -> dict:
         "need_risk": bool(plan.get("need_risk", False)),
         "need_comparison": bool(plan.get("need_comparison", False)),
         "need_hypothesis": bool(plan.get("need_hypothesis", False)),
+        "need_deep_read": bool(plan.get("need_deep_read", False)),
         "comparison_dimensions": plan.get("comparison_dimensions", []),
         "need_reflection": bool(plan.get("need_reflection", False)),
         "use_financial_report": bool(plan.get("use_financial_report", False)),
@@ -1189,6 +1290,67 @@ def _format_hypothesis_section(hypothesis_result: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_deep_read_section(deep_read_result: Optional[dict]) -> str:
+    if not deep_read_result:
+        return ""
+
+    summary = deep_read_result.get("summary", "")
+    metrics = deep_read_result.get("key_metrics") or []
+    claims = deep_read_result.get("key_claims") or []
+    questions = deep_read_result.get("critical_questions") or []
+
+    if not summary and not questions:
+        return ""
+
+    lines = ["", "## 深度分析与批判报告", ""]
+    if summary:
+        lines.extend(["### 核心摘要", summary, ""])
+
+    if metrics:
+        lines.extend([
+            "### 关键指标提取",
+            "",
+            "| 指标 | 数值 | 意义 |",
+            "|---|---|---|",
+        ])
+        for m in metrics:
+            name = str(m.get("name", "")).replace("|", "/")
+            val = str(m.get("value", "")).replace("|", "/")
+            sig = str(m.get("significance", "")).replace("|", "/")
+            lines.append(f"| {name} | {val} | {sig} |")
+        lines.append("")
+
+    if claims:
+        lines.extend(["### 核心论点", ""])
+        for c in claims:
+            lines.append(f"- {c}")
+        lines.append("")
+
+    if questions:
+        lines.extend([
+            "### 深度质疑清单",
+            "",
+            "| 质疑问题 | 依据 | 严重性 |",
+            "|---|---|---|",
+        ])
+        for q in questions:
+            ques = str(q.get("question", "")).replace("|", "/")
+            basis = str(q.get("basis", "")).replace("|", "/")
+            sev = str(q.get("severity", "")).replace("|", "/")
+            lines.append(f"| {ques} | {basis} | {sev} |")
+        lines.append("")
+
+    rel_score = deep_read_result.get("reliability_score")
+    if rel_score is not None:
+        lines.append(f"**综合可信度评分：** {rel_score}/10")
+
+    conclusion = deep_read_result.get("conclusion")
+    if conclusion:
+        lines.append(f"**分析结论：** {conclusion}")
+
+    return "\n".join(lines)
+
+
 def _parse_json_from_text(text: str) -> dict:
     raw = text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
@@ -1346,6 +1508,10 @@ def report_node(state: AgentState) -> dict:
     if hypothesis_section:
         response = f"{response.rstrip()}\n\n{hypothesis_section}"
 
+    deep_read_section = _format_deep_read_section(state.get("deep_read_result"))
+    if deep_read_section:
+        response = f"{response.rstrip()}\n\n{deep_read_section}"
+
     email_tool_calls = []
     email_errors = []
     email_status = ""
@@ -1483,6 +1649,7 @@ def build_graph():
     builder.add_node("risk_node", risk_node)
     builder.add_node("comparison_node", comparison_node)
     builder.add_node("hypothesis_node", hypothesis_node)
+    builder.add_node("deep_read_node", deep_read_node)
     builder.add_node("reflection_node", reflection_node)
     builder.add_node("report_node", report_node)
 
@@ -1497,17 +1664,30 @@ def build_graph():
     builder.add_conditional_edges(
         "parse_node",
         route_after_parse,
-        ["financial_report_node", "data_node", "news_node", "rag_node", "scoring_node", "risk_node", "comparison_node", "hypothesis_node", "reflection_node", "report_node"],
+        ["financial_report_node", "data_node", "news_node", "rag_node", "scoring_node", "risk_node", "comparison_node", "hypothesis_node", "deep_read_node", "reflection_node", "report_node"],
     )
 
-    # financial_report_node 完成后进并行节点
+    # financial_report_node 完成后进 deep_read_node 或并行节点
     def route_after_financial(state: AgentState):
+        if state.get("need_deep_read"):
+            return "deep_read_node"
         targets = _parallel_targets(state)
         return targets if targets else _analysis_targets(state)
 
     builder.add_conditional_edges(
         "financial_report_node",
         route_after_financial,
+        ["deep_read_node", "data_node", "news_node", "rag_node", "scoring_node", "risk_node", "comparison_node", "hypothesis_node", "reflection_node"],
+    )
+
+    # deep_read_node 完成后进并行节点
+    def route_after_deep_read(state: AgentState):
+        targets = _parallel_targets(state)
+        return targets if targets else _analysis_targets(state)
+
+    builder.add_conditional_edges(
+        "deep_read_node",
+        route_after_deep_read,
         ["data_node", "news_node", "rag_node", "scoring_node", "risk_node", "comparison_node", "hypothesis_node", "reflection_node"],
     )
 
@@ -1529,7 +1709,7 @@ def build_graph():
     builder.add_edge("rag_node", "reflection_node")
 
     # 所有分析节点汇入 report_node
-    builder.add_edge(["scoring_node", "risk_node", "comparison_node", "hypothesis_node", "reflection_node"], "report_node")
+    builder.add_edge(["scoring_node", "risk_node", "comparison_node", "hypothesis_node", "deep_read_node", "reflection_node"], "report_node")
 
     builder.add_edge("report_node", END)
 
@@ -1557,6 +1737,8 @@ def _analysis_targets(state: AgentState) -> list:
         targets.append("comparison_node")
     if state.get("need_hypothesis"):
         targets.append("hypothesis_node")
+    if state.get("need_deep_read"):
+        targets.append("deep_read_node")
     if state.get("need_reflection"):
         targets.append("reflection_node")
     return targets
