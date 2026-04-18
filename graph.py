@@ -1437,7 +1437,11 @@ def report_node(state: AgentState) -> dict:
         return text, model
 
     if dev_mode or gemini_exhausted:
-        response, final_model = call_groq()
+        try:
+            response, final_model = call_groq()
+        except Exception as exc:
+            response = f"⚠️ 报告生成失败，所有 Groq 模型均不可用：{exc}"
+            final_model = "none"
         new_gemini_exhausted = False
     else:
         from langchain_google_genai import ChatGoogleGenerativeAI
