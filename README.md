@@ -50,7 +50,7 @@ TAVILY_API_KEY=your_tavily_api_key
 用户提问
    ↓
 parse_node（QUALITY_CASCADE）
-  └─ 分析问题，生成调度计划（JSON），含 need_scoring 判断
+  └─ 分析问题，生成调度计划（JSON），含 need_scoring / need_risk 判断
    ↓ 条件路由
    ├─ [条件] financial_report_node → pdfplumber Map + QUALITY_CASCADE Reduce
    ↓ 条件路由（并行）
@@ -58,12 +58,15 @@ parse_node（QUALITY_CASCADE）
    ├─ [条件] news_node   → Tavily 搜索新闻    → LLaMA 新闻摘要+情绪判断
    └─ [条件] rag_node    → ChromaDB 检索财报  → QUALITY_CASCADE 财务指标提取
    ↓ fan-in
-[条件] scoring_node（QUALITY_CASCADE）
+[条件并行] scoring_node（QUALITY_CASCADE）
   └─ need_scoring=true 时才触发，Chain-of-Thought 多维度评分
+[条件并行] risk_node（gpt-oss-120b）
+  └─ need_risk=true 时才触发，输出结构化风险矩阵
    ↓
 report_node
   ├─ 运行模式：Gemini 2.5 Flash（失败时 fallback → Groq QUALITY_CASCADE）
-  └─ 开发模式：Groq QUALITY_CASCADE
+  ├─ 开发模式：Groq QUALITY_CASCADE
+  └─ 如有 risk_result，在报告末尾追加「风险矩阵」章节
 ```
 
 每个中间节点都是真正的 Agent：先调用工具拿到原始数据，再用 LLM 做领域分析，
@@ -78,11 +81,13 @@ class AgentState(TypedDict):
     tickers: List[str]
     need_data: bool; need_news: bool; need_rag: bool; need_history: bool
     need_scoring: bool          # 是否需要多维度评分（综合分析=True，简单查价=False）
+    need_risk: bool             # 是否需要风险矩阵（风险/隐患/担忧/risk=True）
     use_financial_report: bool  # 是否触发 financial_report_node
     pdf_path: Optional[str]
     financial_metrics: Optional[dict]; risk_signals: Optional[list]; report_citations: Optional[list]
     stock_data: str; news: str; rag_result: str
     scoring_result: dict  # scoring_node 输出的多维度评分 JSON
+    risk_result: Optional[dict]  # risk_node 输出的结构化风险矩阵 JSON
     report: str; email_status: str; final_model: str
     gemini_exhausted: bool
     tool_calls: Annotated[List[dict], operator.add]  # 并行节点自动合并
@@ -126,14 +131,15 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 | 节点 | 策略 |
 |------|------|
 | parse / rag / scoring / report(Groq) / financial_report Reduce | QUALITY_CASCADE（上→下依次降级） |
+| risk | TIER_TOP（openai/gpt-oss-120b，结构化风险矩阵） |
 | data / news / financial_report Map | TIER_LOW 直接调用，不级联 |
 
 ## 双模式运行
 
-| 模式 | parse/rag/scoring | data/news | report_node |
-|------|-------------------|-----------|-------------|
-| 开发模式（dev_mode=True） | QUALITY_CASCADE | LLaMA | Groq QUALITY_CASCADE |
-| 运行模式（dev_mode=False） | QUALITY_CASCADE | LLaMA | Gemini 2.5 Flash → Groq fallback |
+| 模式 | parse/rag/scoring | risk | data/news | report_node |
+|------|-------------------|------|-----------|-------------|
+| 开发模式（dev_mode=True） | QUALITY_CASCADE | gpt-oss-120b | LLaMA | Groq QUALITY_CASCADE |
+| 运行模式（dev_mode=False） | QUALITY_CASCADE | gpt-oss-120b | LLaMA | Gemini 2.5 Flash → Groq fallback |
 
 切换：侧边栏「🛠️ 开发模式」toggle
 
@@ -171,8 +177,6 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
 ### `send_email_report(to, subject, body)`
 - Gmail API，首次需 OAuth 授权生成 `token.pickle`
-
----
 
 ## 性能优化记录
 

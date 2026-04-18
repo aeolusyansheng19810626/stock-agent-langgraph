@@ -82,6 +82,7 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "rag_params": {"query": "Apple revenue earnings Q4"},
   "email_params": null,
   "need_scoring": false,
+  "need_risk": false,
   "use_financial_report": false,
   "pdf_path": null
 }
@@ -116,6 +117,9 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - need_scoring 规则：
       true  → 用户要求综合分析、投资建议、买卖评级、值不值得买等
       false → 只查股价、只查新闻、只查某项数据等单一问题
+  - need_risk 规则：
+      true  → 用户问到"风险"、"隐患"、"担忧"、"有什么问题"、"risk"
+      false → 未询问风险相关内容
 """
 
 SCORING_SYSTEM = """你是一名资深股票分析师，专注于综合量化评分。你将收到一支股票的技术面数据、新闻情绪和财报信息。
@@ -155,6 +159,25 @@ Step 4 综合推理（overall_reasoning / final_rating / confidence）：
   "overall_reasoning": "<综合推理说明>"
 }"""
 
+RISK_SYSTEM = """你是一名股票风险分析师。你将收到一支股票的财务指标、技术面数据和新闻信息。
+
+请只基于输入数据识别关键风险，输出纯 JSON，禁止输出任何其他文字。
+
+输出格式：
+{
+  "risk_factors": [
+    {
+      "id": 1,
+      "category": "财务风险|市场风险|宏观风险",
+      "title": "...",
+      "reasoning": "数据依据 → 传导路径 → 最终影响",
+      "severity": "高|中|低",
+      "trigger": "什么情况下会爆发"
+    }
+  ],
+  "risk_summary": "整体风险评估一句话"
+}"""
+
 REPORT_SYSTEM = """你是一个专业的股票分析师，拥有10年股市投资经验。
 
 你将收到由多个数据源汇总而来的上下文（实时股价、历史走势、新闻、财报等），
@@ -185,6 +208,7 @@ class AgentState(TypedDict):
     rag_available: bool
 
     need_scoring: bool
+    need_risk: bool
     pdf_path: Optional[str]
     use_financial_report: bool
     financial_metrics: Optional[dict]
@@ -198,6 +222,7 @@ class AgentState(TypedDict):
     news: str
     rag_result: str
     scoring_result: dict
+    risk_result: Optional[dict]
 
     report: str
     email_status: str
@@ -312,6 +337,9 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
     need_scoring = any(
         kw in text for kw in ("综合", "分析", "建议", "评级", "值不值", "买入", "卖出", "投资")
     ) or len(agents) >= 2
+    need_risk = any(
+        kw in text for kw in ("风险", "隐患", "担忧", "有什么问题", "risk")
+    )
 
     return {
         "agents": agents,
@@ -324,6 +352,7 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
         "rag_params": {"query": user_input} if need_rag else None,
         "email_params": None,
         "need_scoring": need_scoring,
+        "need_risk": need_risk,
         "use_financial_report": use_financial_report,
         "pdf_path": _extract_pdf_path(user_input),
     }
@@ -371,6 +400,9 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
 
     use_financial_report = bool(plan.get("use_financial_report", False))
     need_scoring = bool(plan.get("need_scoring", False))
+    need_risk = bool(plan.get("need_risk", False)) or any(
+        kw in user_input.lower() for kw in ("风险", "隐患", "担忧", "有什么问题", "risk")
+    )
 
     if not agents:
         return _infer_plan_from_text(user_input, rag_available)
@@ -386,6 +418,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         "rag_params": {"query": rag_query} if "rag" in agents else None,
         "email_params": email_params,
         "need_scoring": need_scoring,
+        "need_risk": need_risk,
         "use_financial_report": use_financial_report,
     }
 
@@ -427,6 +460,7 @@ def parse_node(state: AgentState) -> dict:
         "rag_query": rag_params.get("query", ""),
         "email_params": plan.get("email_params"),
         "need_scoring": bool(plan.get("need_scoring", False)),
+        "need_risk": bool(plan.get("need_risk", False)),
         "use_financial_report": bool(plan.get("use_financial_report", False)),
         "pdf_path": plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
         "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": model_used}}],
@@ -698,6 +732,105 @@ def scoring_node(state: AgentState) -> dict:
     return {"scoring_result": scoring, "tool_calls": tool_calls, "errors": errors}
 
 
+def risk_node(state: AgentState) -> dict:
+    if not state.get("need_risk"):
+        return {"risk_result": {}, "tool_calls": [], "errors": []}
+
+    parts = []
+    if state.get("financial_metrics"):
+        parts.append("[财务指标]\n" + json.dumps(state.get("financial_metrics"), ensure_ascii=False, indent=2))
+    if state.get("stock_data"):
+        parts.append(f"[技术面数据]\n{state['stock_data']}")
+    if state.get("news"):
+        parts.append(f"[新闻信息]\n{state['news']}")
+
+    if not parts:
+        return {"risk_result": {}, "tool_calls": [], "errors": []}
+
+    context = "\n\n".join(parts)
+    errors = []
+    risk_result = {}
+    risk_model = TIER_TOP
+
+    try:
+        raw, risk_model = _invoke_with_cascade(
+            [SystemMessage(content=RISK_SYSTEM), HumanMessage(content=f"请分析以下数据中的风险：\n\n{context}")],
+            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            [TIER_TOP],
+        )
+        raw = raw.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+
+        try:
+            risk_result = json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                try:
+                    risk_result = json.loads(match.group())
+                except Exception as parse_exc:
+                    errors.append({
+                        "node": "risk_node",
+                        "tool": "json_parse",
+                        "message": str(parse_exc),
+                        "retryable": False,
+                    })
+            else:
+                errors.append({
+                    "node": "risk_node",
+                    "tool": "json_parse",
+                    "message": f"No JSON found in response: {raw[:200]}",
+                    "retryable": False,
+                })
+    except Exception as exc:
+        errors.append({
+            "node": "risk_node",
+            "tool": "llm_risk",
+            "message": str(exc),
+            "retryable": False,
+        })
+
+    tool_calls = (
+        [{"tool_name": "llm", "tool_args": {"node": "risk", "model": risk_model}}]
+        if risk_result else []
+    )
+    return {"risk_result": risk_result, "tool_calls": tool_calls, "errors": errors}
+
+
+def _format_risk_matrix(risk_result: Optional[dict]) -> str:
+    if not risk_result:
+        return ""
+
+    factors = risk_result.get("risk_factors") or []
+    if not factors:
+        return ""
+
+    lines = [
+        "",
+        "## 风险矩阵",
+        "",
+        "| ID | 类别 | 风险 | 严重性 | 触发条件 |",
+        "|---:|---|---|---|---|",
+    ]
+    for index, item in enumerate(factors, start=1):
+        risk_id = item.get("id", index)
+        category = str(item.get("category", "")).replace("|", "/")
+        title = str(item.get("title", "")).replace("|", "/")
+        severity = str(item.get("severity", "")).replace("|", "/")
+        trigger = str(item.get("trigger", "")).replace("|", "/")
+        reasoning = str(item.get("reasoning", "")).strip()
+        if reasoning:
+            title = f"{title}<br>{reasoning}" if title else reasoning
+        lines.append(f"| {risk_id} | {category} | {title} | {severity} | {trigger} |")
+
+    summary = str(risk_result.get("risk_summary", "")).strip()
+    if summary:
+        lines.extend(["", f"**整体风险评估：** {summary}"])
+
+    return "\n".join(lines)
+
+
 def report_node(state: AgentState) -> dict:
     groq_api_key = state.get("groq_api_key") or os.getenv("GROQ_API_KEY", "")
     gemini_api_key = state.get("gemini_api_key") or os.getenv("GEMINI_API_KEY", "")
@@ -820,6 +953,10 @@ def report_node(state: AgentState) -> dict:
         if response is None:
             response, final_model = call_groq()
 
+    risk_matrix = _format_risk_matrix(state.get("risk_result"))
+    if risk_matrix:
+        response = f"{response.rstrip()}\n\n{risk_matrix}"
+
     email_tool_calls = []
     email_errors = []
     email_status = ""
@@ -888,6 +1025,7 @@ def build_graph():
     builder.add_node("news_node", news_node)
     builder.add_node("rag_node", rag_node)
     builder.add_node("scoring_node", scoring_node)
+    builder.add_node("risk_node", risk_node)
     builder.add_node("report_node", report_node)
 
     builder.add_edge(START, "parse_node")
@@ -896,30 +1034,33 @@ def build_graph():
     def route_after_parse(state: AgentState):
         if state.get("use_financial_report"):
             return "financial_report_node"
-        return _parallel_targets(state) or "report_node"
+        return _parallel_targets(state) or _analysis_targets(state) or "report_node"
 
     builder.add_conditional_edges(
         "parse_node",
         route_after_parse,
-        ["financial_report_node", "data_node", "news_node", "rag_node", "report_node"],
+        ["financial_report_node", "data_node", "news_node", "rag_node", "scoring_node", "risk_node", "report_node"],
     )
 
     # financial_report_node 完成后进并行节点
     def route_after_financial(state: AgentState):
         targets = _parallel_targets(state)
-        return targets if targets else "scoring_node"
+        return targets if targets else _analysis_targets(state)
 
     builder.add_conditional_edges(
         "financial_report_node",
         route_after_financial,
-        ["data_node", "news_node", "rag_node", "scoring_node"],
+        ["data_node", "news_node", "rag_node", "scoring_node", "risk_node"],
     )
 
-    # 并行节点完成后汇入 scoring_node，再进 report_node
+    # 并行节点完成后同时进入 scoring/risk；report_node 等两个分析节点都完成。
     builder.add_edge("data_node", "scoring_node")
     builder.add_edge("news_node", "scoring_node")
     builder.add_edge("rag_node", "scoring_node")
-    builder.add_edge("scoring_node", "report_node")
+    builder.add_edge("data_node", "risk_node")
+    builder.add_edge("news_node", "risk_node")
+    builder.add_edge("rag_node", "risk_node")
+    builder.add_edge(["scoring_node", "risk_node"], "report_node")
     builder.add_edge("report_node", END)
 
     return builder.compile()
@@ -934,6 +1075,12 @@ def _parallel_targets(state: AgentState) -> list:
     if state.get("need_rag"):
         targets.append("rag_node")
     return targets
+
+
+def _analysis_targets(state: AgentState) -> list:
+    if state.get("need_scoring") or state.get("need_risk") or state.get("use_financial_report"):
+        return ["scoring_node", "risk_node"]
+    return []
 
 
 graph = build_graph()
