@@ -271,6 +271,6 @@ def financial_report_node(state: dict) -> dict:
         "financial_metrics": final.get("financial_metrics"),
         "risk_signals": final.get("risk_signals"),
         "report_citations": final.get("report_citations"),
-        "tool_calls": [{"tool_name": "financial_report_node", "tool_args": {"pdf_path": pdf_path}}],
+        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "financial_report", "model": f"Map:{FAST_MODEL} → Reduce:{QUALITY_MODEL}"}}],
         "errors": errors,
     }

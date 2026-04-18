@@ -397,6 +397,7 @@ def parse_node(state: AgentState) -> dict:
         "email_params": plan.get("email_params"),
         "use_financial_report": bool(plan.get("use_financial_report", False)),
         "pdf_path": plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
+        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": PARSE_MODEL}}],
         "errors": [],
     }
 
@@ -471,6 +472,7 @@ def data_node(state: AgentState) -> dict:
             analysis_text = _extract_text(resp.content).strip()
             if analysis_text:
                 analysis = f"[技术面分析 by data_agent]\n{analysis_text}\n\n[原始数据]\n{raw_text}"
+                tool_calls.append({"tool_name": "llm", "tool_args": {"node": "data", "model": DATA_AGENT_MODEL}})
         except Exception as exc:
             errors.append({
                 "node": "data_node",
@@ -526,6 +528,7 @@ def news_node(state: AgentState) -> dict:
         analysis_text = _extract_text(resp.content).strip()
         if analysis_text:
             analysis = f"[新闻摘要 by news_agent]\n{analysis_text}\n\n[原始新闻]\n{raw_result}"
+            tool_calls.append({"tool_name": "llm", "tool_args": {"node": "news", "model": NEWS_AGENT_MODEL}})
     except Exception as exc:
         errors.append({
             "node": "news_node",
@@ -577,6 +580,7 @@ def rag_node(state: AgentState) -> dict:
         analysis_text = _extract_text(resp.content).strip()
         if analysis_text:
             analysis = f"[财报分析 by rag_agent]\n{analysis_text}\n\n[原始检索结果]\n{raw_result}"
+            tool_calls.append({"tool_name": "llm", "tool_args": {"node": "rag", "model": RAG_AGENT_MODEL}})
     except Exception as exc:
         errors.append({
             "node": "rag_node",
@@ -842,12 +846,13 @@ def report_node(state: AgentState) -> dict:
             })
             email_status = f"Not sent. {exc}"
 
+    report_model_record = {"tool_name": "llm", "tool_args": {"node": "report", "model": final_model}}
     return {
         "report": response,
         "email_status": email_status,
         "final_model": final_model,
         "gemini_exhausted": new_gemini_exhausted,
-        "tool_calls": email_tool_calls,
+        "tool_calls": [report_model_record] + email_tool_calls,
         "errors": email_errors,
     }
 

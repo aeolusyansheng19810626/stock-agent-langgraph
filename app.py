@@ -1106,10 +1106,24 @@ if user_input:
             final_response = result["final_response"]
             final_model    = result["final_model"]
 
+            # 从 tool_calls 里提取各节点模型记录，拼成 footer
+            _node_model_parts = []
+            _node_order = ["parse", "financial_report", "data", "news", "rag", "scoring", "report"]
+            _node_model_map = {}
+            for tc in result["tool_calls"]:
+                if tc.get("tool_name") == "llm":
+                    n = tc["tool_args"].get("node", "")
+                    m = tc["tool_args"].get("model", "")
+                    _node_model_map[n] = m
+            for _n in _node_order:
+                if _n in _node_model_map:
+                    _node_model_parts.append(f"{_n}: {_node_model_map[_n]}")
+            _model_footer = " | ".join(_node_model_parts) if _node_model_parts else final_model
+
             st.session_state.chat_history.append(AIMessage(content=final_response))
             with st.chat_message("assistant"):
                 st.markdown(final_response)
-                st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。　　由 {final_model} 生成")
+                st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。　　{_model_footer}")
             st.session_state.messages.append({"role": "assistant", "content": final_response, "model": final_model})
 
             status_box.update(label="✅ 分析完成", state="complete", expanded=False)
