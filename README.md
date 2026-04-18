@@ -64,6 +64,8 @@ parse_node（QUALITY_CASCADE）
   └─ need_risk=true 时才触发，输出结构化风险矩阵
 [条件并行] comparison_node（gpt-oss-120b）
   └─ need_comparison=true 时才触发，输出对比排名、胜出方和逐维度对比表
+[条件并行] hypothesis_node（gpt-oss-120b）
+  └─ need_hypothesis=true 时触发（如果/假设/what if），输出传导路径和情景分析表
    ↓
 report_node
   ├─ 运行模式：Gemini 2.5 Flash（失败时 fallback → Groq QUALITY_CASCADE）
@@ -88,6 +90,7 @@ class AgentState(TypedDict):
     need_scoring: bool          # 是否需要多维度评分（综合分析=True，简单查价=False）
     need_risk: bool             # 是否需要风险矩阵（风险/隐患/担忧/risk=True）
     need_comparison: bool       # 是否需要多股票对比
+    need_hypothesis: bool       # 是否需要假设推演（如果/假设/what if=True）
     need_reflection: bool       # 是否需要报告自我反思（深度/详细/严谨/全面或need_scoring=True）
     comparison_dimensions: List[str]  # 指定对比维度，空列表代表全维度
     use_financial_report: bool  # 是否触发 financial_report_node
@@ -97,6 +100,7 @@ class AgentState(TypedDict):
     scoring_result: dict  # scoring_node 输出的多维度评分 JSON
     risk_result: Optional[dict]  # risk_node 输出的结构化风险矩阵 JSON
     comparison_result: Optional[dict]  # comparison_node 输出的排名和对比表 JSON
+    hypothesis_result: Optional[dict]  # hypothesis_node 输出的推演结论 JSON
     reflection_result: Optional[str]  # reflection_node 输出的问题列表/严重程度/修订建议 JSON 字符串
     report: str; final_report: str; email_status: str; final_model: str
     gemini_exhausted: bool
@@ -143,6 +147,7 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 | parse / rag / scoring / report(Groq) / financial_report Reduce | QUALITY_CASCADE（上→下依次降级） |
 | risk | TIER_TOP（openai/gpt-oss-120b，结构化风险矩阵） |
 | comparison | TIER_TOP（openai/gpt-oss-120b，结构化对比排名和表格） |
+| hypothesis | TIER_TOP（openai/gpt-oss-120b，假设推演结论） |
 | reflection | TIER_TOP（openai/gpt-oss-120b，报告审核与修订） |
 | data / news / financial_report Map | TIER_LOW 直接调用，不级联 |
 
