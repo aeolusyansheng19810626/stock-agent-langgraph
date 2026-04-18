@@ -18,6 +18,7 @@ from tools import (
     search_web,
     send_email_report,
 )
+from nodes import financial_report_node
 
 
 FAST_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -72,7 +73,8 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "data_params": {"tickers": ["AAPL"], "need_history": false, "periods": ["6mo"]},
   "news_params": {"query": "Apple latest news 2025"},
   "rag_params": {"query": "Apple revenue earnings Q4"},
-  "email_params": null
+  "email_params": null,
+  "use_financial_report": false
 }
 
 agents 字段从以下选择（可多选）：data / news / rag / email
@@ -99,6 +101,8 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - news/rag query: 英文关键词，包含公司名和具体主题
   - email_params: 用户明确要求发邮件时填写 {"to": "邮箱地址", "subject": "主题"}，否则 null
   - 用户未提供邮箱时 email_params 为 null
+  - 用户提到"财报"、"年报"、"10-K"、"20-F"、"上传PDF"、"读财报"或提供文件路径时 → use_financial_report: true
+  - use_financial_report 为 true 时，仍需正常填写其他 agents 字段
 """
 
 SCORING_SYSTEM = """你是一名资深股票分析师，专注于综合量化评分。你将收到一支股票的技术面数据、新闻情绪和财报信息。
@@ -166,6 +170,12 @@ class AgentState(TypedDict):
     rag_query: str
     email_params: Optional[dict]
     rag_available: bool
+
+    pdf_path: Optional[str]
+    use_financial_report: bool
+    financial_metrics: Optional[dict]
+    risk_signals: Optional[list]
+    report_citations: Optional[list]
 
     tool_calls: Annotated[List[dict], operator.add]
     errors: Annotated[List[dict], operator.add]
@@ -260,6 +270,10 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
     if not agents:
         agents = ["news"] if not tickers else ["data"]
 
+    use_financial_report = any(
+        kw in text for kw in ("财报", "年报", "10-k", "20-f", "上传pdf", "读财报")
+    )
+
     return {
         "agents": agents,
         "data_params": {
@@ -270,6 +284,7 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
         "news_params": {"query": user_input} if need_news or agents == ["news"] else None,
         "rag_params": {"query": user_input} if need_rag else None,
         "email_params": None,
+        "use_financial_report": use_financial_report,
     }
 
 
@@ -313,6 +328,8 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
     if email_params and not str(email_params.get("to", "")).strip():
         email_params = None
 
+    use_financial_report = bool(plan.get("use_financial_report", False))
+
     if not agents:
         return _infer_plan_from_text(user_input, rag_available)
 
@@ -326,6 +343,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         "news_params": {"query": news_query} if "news" in agents else None,
         "rag_params": {"query": rag_query} if "rag" in agents else None,
         "email_params": email_params,
+        "use_financial_report": use_financial_report,
     }
 
 
@@ -368,6 +386,7 @@ def parse_node(state: AgentState) -> dict:
         "news_query": news_params.get("query", ""),
         "rag_query": rag_params.get("query", ""),
         "email_params": plan.get("email_params"),
+        "use_financial_report": bool(plan.get("use_financial_report", False)),
         "errors": [],
     }
 
@@ -571,6 +590,13 @@ def scoring_node(state: AgentState) -> dict:
         parts.append(f"[新闻情绪]\n{state['news']}")
     if state.get("rag_result"):
         parts.append(f"[财报数据]\n{state['rag_result']}")
+    if state.get("financial_metrics"):
+        fm = state["financial_metrics"]
+        risk_lines = "\n".join(f"- {r}" for r in (state.get("risk_signals") or []))
+        parts.append(
+            f"[精读财报指标]\n{json.dumps(fm, ensure_ascii=False, indent=2)}"
+            + (f"\n[风险信号]\n{risk_lines}" if risk_lines else "")
+        )
 
     if not parts:
         return {"scoring_result": {}, "tool_calls": [], "errors": []}
@@ -806,6 +832,7 @@ def build_graph():
     builder = StateGraph(AgentState)
 
     builder.add_node("parse_node", parse_node)
+    builder.add_node("financial_report_node", financial_report_node)
     builder.add_node("data_node", data_node)
     builder.add_node("news_node", news_node)
     builder.add_node("rag_node", rag_node)
@@ -814,22 +841,27 @@ def build_graph():
 
     builder.add_edge(START, "parse_node")
 
-    def route_to_agents(state: AgentState):
-        targets = []
-        if state.get("need_data"):
-            targets.append("data_node")
-        if state.get("need_news"):
-            targets.append("news_node")
-        if state.get("need_rag"):
-            targets.append("rag_node")
-        if not targets:
-            return "report_node"
-        return targets
+    # parse_node → financial_report_node（条件）或直接进并行节点
+    def route_after_parse(state: AgentState):
+        if state.get("use_financial_report"):
+            return "financial_report_node"
+        return _parallel_targets(state) or "report_node"
 
     builder.add_conditional_edges(
         "parse_node",
-        route_to_agents,
-        ["data_node", "news_node", "rag_node", "report_node"],
+        route_after_parse,
+        ["financial_report_node", "data_node", "news_node", "rag_node", "report_node"],
+    )
+
+    # financial_report_node 完成后进并行节点
+    def route_after_financial(state: AgentState):
+        targets = _parallel_targets(state)
+        return targets if targets else "scoring_node"
+
+    builder.add_conditional_edges(
+        "financial_report_node",
+        route_after_financial,
+        ["data_node", "news_node", "rag_node", "scoring_node"],
     )
 
     # 并行节点完成后汇入 scoring_node，再进 report_node
@@ -840,6 +872,17 @@ def build_graph():
     builder.add_edge("report_node", END)
 
     return builder.compile()
+
+
+def _parallel_targets(state: AgentState) -> list:
+    targets = []
+    if state.get("need_data"):
+        targets.append("data_node")
+    if state.get("need_news"):
+        targets.append("news_node")
+    if state.get("need_rag"):
+        targets.append("rag_node")
+    return targets
 
 
 graph = build_graph()

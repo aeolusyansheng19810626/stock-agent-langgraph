@@ -13,4 +13,6 @@ google-api-python-client
 mcp
 chromadb
 pypdf
+pdfplumber>=0.10.0
+httpx>=0.27.0
 sentence-transformers
