@@ -85,6 +85,7 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "need_risk": false,
   "need_comparison": false,
   "comparison_dimensions": [],
+  "need_reflection": false,
   "use_financial_report": false,
   "pdf_path": null
 }
@@ -128,6 +129,10 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - comparison_dimensions:
       从用户输入中提取指定维度，如 ["估值", "技术面", "新闻情绪"]
       用户未指定维度时输出 []，代表全维度对比
+  - need_reflection 规则：
+      true  → 用户要求"深度分析"、"详细"、"严谨"、"全面"
+      true  → need_scoring=true 时同步开启
+      false → 简单查价、简单新闻、单项数据查询
 """
 
 SCORING_SYSTEM = """你是一名资深股票分析师，专注于综合量化评分。你将收到一支股票的技术面数据、新闻情绪和财报信息。
@@ -205,6 +210,21 @@ RISK_SYSTEM = """你是一名股票风险分析师。你将收到一支股票的
   "risk_summary": "整体风险评估一句话"
 }"""
 
+REFLECTION_SYSTEM = """你是一个严苛的金融分析审核员。
+下面是一份股票分析报告，请从以下角度批判：
+1. 数据是否有遗漏或矛盾
+2. 结论是否有逻辑跳跃
+3. 风险提示是否充分
+4. 投资建议是否过于武断
+
+请输出纯 JSON，禁止输出任何其他文字：
+{
+  "issues": ["问题1", "问题2"],
+  "severity": "高/中/低",
+  "revised_sections": "需要修订的段落建议",
+  "revised_report": "基于以上批判修订后的完整报告"
+}"""
+
 REPORT_SYSTEM = """你是一个专业的股票分析师，拥有10年股市投资经验。
 
 你将收到由多个数据源汇总而来的上下文（实时股价、历史走势、新闻、财报等），
@@ -237,6 +257,7 @@ class AgentState(TypedDict):
     need_scoring: bool
     need_risk: bool
     need_comparison: bool
+    need_reflection: bool
     comparison_dimensions: List[str]
     pdf_path: Optional[str]
     use_financial_report: bool
@@ -253,8 +274,10 @@ class AgentState(TypedDict):
     scoring_result: dict
     risk_result: Optional[dict]
     comparison_result: Optional[dict]
+    reflection_result: Optional[str]
 
     report: str
+    final_report: str
     email_status: str
     final_model: str
     gemini_exhausted: bool
@@ -394,6 +417,9 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
     need_risk = any(
         kw in text for kw in ("风险", "隐患", "担忧", "有什么问题", "risk")
     )
+    need_reflection = need_scoring or any(
+        kw in text for kw in ("深度分析", "详细", "严谨", "全面")
+    )
 
     return {
         "agents": agents,
@@ -409,6 +435,7 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
         "need_risk": need_risk,
         "need_comparison": need_comparison,
         "comparison_dimensions": comparison_dimensions,
+        "need_reflection": need_reflection,
         "use_financial_report": use_financial_report,
         "pdf_path": _extract_pdf_path(user_input),
     }
@@ -465,6 +492,11 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
     need_comparison = bool(plan.get("need_comparison", False)) or len(tickers) >= 2 or any(
         kw in user_input.lower() for kw in ("对比", "比较", "pk", "哪个更好", "compare")
     )
+    need_reflection = (
+        bool(plan.get("need_reflection", False))
+        or need_scoring
+        or any(kw in user_input.lower() for kw in ("深度分析", "详细", "严谨", "全面"))
+    )
 
     if need_comparison and tickers and "data" not in agents:
         agents.append("data")
@@ -490,6 +522,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         "need_risk": need_risk,
         "need_comparison": need_comparison,
         "comparison_dimensions": comparison_dimensions,
+        "need_reflection": need_reflection,
         "use_financial_report": use_financial_report,
     }
 
@@ -534,6 +567,7 @@ def parse_node(state: AgentState) -> dict:
         "need_risk": bool(plan.get("need_risk", False)),
         "need_comparison": bool(plan.get("need_comparison", False)),
         "comparison_dimensions": plan.get("comparison_dimensions", []),
+        "need_reflection": bool(plan.get("need_reflection", False)),
         "use_financial_report": bool(plan.get("use_financial_report", False)),
         "pdf_path": plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
         "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": model_used}}],
@@ -1030,6 +1064,22 @@ def _format_risk_matrix(risk_result: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+def _parse_json_from_text(text: str) -> dict:
+    raw = text.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            return json.loads(match.group())
+        except Exception:
+            return {}
+
+
 def report_node(state: AgentState) -> dict:
     groq_api_key = state.get("groq_api_key") or os.getenv("GROQ_API_KEY", "")
     gemini_api_key = state.get("gemini_api_key") or os.getenv("GEMINI_API_KEY", "")
@@ -1211,12 +1261,78 @@ def report_node(state: AgentState) -> dict:
     report_model_record = {"tool_name": "llm", "tool_args": {"node": "report", "model": final_model}}
     return {
         "report": response,
+        "final_report": response,
         "email_status": email_status,
         "final_model": final_model,
         "gemini_exhausted": new_gemini_exhausted,
         "tool_calls": [report_model_record] + email_tool_calls,
         "errors": email_errors,
     }
+
+
+def reflection_node(state: AgentState) -> dict:
+    report = state.get("report") or state.get("final_report") or ""
+    if not state.get("need_reflection") or not report.strip():
+        return {
+            "final_report": report,
+            "reflection_result": None,
+            "tool_calls": [],
+            "errors": [],
+        }
+
+    reflection_model = TIER_TOP
+    errors = []
+    try:
+        raw, reflection_model = _invoke_with_cascade(
+            [SystemMessage(content=REFLECTION_SYSTEM), HumanMessage(content=f"股票分析报告：\n\n{report}")],
+            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            [TIER_TOP],
+        )
+        parsed = _parse_json_from_text(raw)
+        if not parsed:
+            errors.append({
+                "node": "reflection_node",
+                "tool": "json_parse",
+                "message": f"No JSON found in response: {raw[:200]}",
+                "retryable": False,
+            })
+            return {
+                "final_report": report,
+                "reflection_result": None,
+                "tool_calls": [],
+                "errors": errors,
+            }
+
+        revised_report = (
+            parsed.get("revised_report")
+            or parsed.get("final_report")
+            or parsed.get("report")
+            or report
+        )
+        reflection_payload = {
+            "issues": parsed.get("issues") or [],
+            "severity": parsed.get("severity", ""),
+            "revised_sections": parsed.get("revised_sections", ""),
+        }
+        return {
+            "final_report": str(revised_report),
+            "reflection_result": json.dumps(reflection_payload, ensure_ascii=False),
+            "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "reflection", "model": reflection_model}}],
+            "errors": [],
+        }
+    except Exception as exc:
+        errors.append({
+            "node": "reflection_node",
+            "tool": "llm_reflection",
+            "message": str(exc),
+            "retryable": False,
+        })
+        return {
+            "final_report": report,
+            "reflection_result": None,
+            "tool_calls": [],
+            "errors": errors,
+        }
 
 
 def build_graph():
@@ -1231,6 +1347,7 @@ def build_graph():
     builder.add_node("risk_node", risk_node)
     builder.add_node("comparison_node", comparison_node)
     builder.add_node("report_node", report_node)
+    builder.add_node("reflection_node", reflection_node)
 
     builder.add_edge(START, "parse_node")
 
@@ -1268,7 +1385,16 @@ def build_graph():
     builder.add_edge("news_node", "comparison_node")
     builder.add_edge("rag_node", "comparison_node")
     builder.add_edge(["scoring_node", "risk_node", "comparison_node"], "report_node")
-    builder.add_edge("report_node", END)
+
+    def route_after_report(state: AgentState):
+        return "reflection_node" if state.get("need_reflection") else END
+
+    builder.add_conditional_edges(
+        "report_node",
+        route_after_report,
+        ["reflection_node", END],
+    )
+    builder.add_edge("reflection_node", END)
 
     return builder.compile()
 

@@ -1,5 +1,6 @@
 import os
 import glob
+import json
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from tools import get_stock_data, search_web, get_stock_history, send_email_report, search_documents
@@ -66,6 +67,29 @@ def extract_text(content) -> str:
                 parts.append(block)
         return "".join(parts)
     return str(content)
+
+
+def render_reflection(reflection_result: str):
+    if not reflection_result:
+        return
+    try:
+        data = json.loads(reflection_result)
+    except Exception:
+        data = {"issues": [reflection_result], "severity": "", "revised_sections": ""}
+
+    with st.expander("自我反思", expanded=False):
+        severity = data.get("severity")
+        if severity:
+            st.markdown(f"**严重程度：** {severity}")
+        issues = data.get("issues") or []
+        if issues:
+            st.markdown("**发现的问题：**")
+            for issue in issues:
+                st.markdown(f"- {issue}")
+        revised_sections = data.get("revised_sections")
+        if revised_sections:
+            st.markdown("**修订建议：**")
+            st.markdown(str(revised_sections))
 
 # ====== 处理上传 PDF，写入向量库 ======
 _PROCESSED_JSON = "./vectorstore/processed_files.json"
@@ -930,6 +954,7 @@ for msg in st.session_state.messages:
     elif role == "assistant":
         with st.chat_message("assistant"):
             st.markdown(msg["content"])
+            render_reflection(msg.get("reflection_result", ""))
             model_label = f"　　由 {msg['model']} 生成" if msg.get("model") else ""
             st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。{model_label}")
     elif role == "tool":
@@ -1051,6 +1076,7 @@ if user_input:
             _final_report        = ""
             _email_status        = ""
             _final_model         = "Groq"
+            _reflection_result   = ""
             _new_gemini_exhausted = False
 
             for _update in _load_graph().stream(_initial_state, stream_mode="updates"):
@@ -1069,20 +1095,26 @@ if user_input:
                             st.session_state.dev_mode or st.session_state.gemini_exhausted
                         ) else "Gemini"
                         status_box.update(label=f"正在生成分析报告（{_model_label}）…")
+                    elif _node_name == "reflection_node":
+                        status_box.update(label="正在进行自我反思与修订…")
                     # Accumulate tool calls from each node's delta output
                     if "tool_calls" in _node_output:
                         _all_tool_calls.extend(_node_output["tool_calls"])
                     if _node_name == "report_node":
-                        _final_report         = _node_output.get("report", "")
+                        _final_report         = _node_output.get("final_report") or _node_output.get("report", "")
                         _email_status         = _node_output.get("email_status", "")
                         _final_model          = _node_output.get("final_model", "Groq")
                         _new_gemini_exhausted = _node_output.get("gemini_exhausted", False)
+                    elif _node_name == "reflection_node":
+                        _final_report       = _node_output.get("final_report", _final_report)
+                        _reflection_result = _node_output.get("reflection_result") or ""
 
             result = {
                 "tool_calls":       _all_tool_calls,
                 "final_response":   _final_report,
                 "email_status":     _email_status,
                 "final_model":      _final_model,
+                "reflection_result": _reflection_result,
                 "gemini_exhausted": _new_gemini_exhausted,
             }
 
@@ -1108,7 +1140,7 @@ if user_input:
 
             # 从 tool_calls 里提取各节点模型记录，拼成 footer
             _node_model_parts = []
-            _node_order = ["parse", "financial_report", "data", "news", "rag", "scoring", "report"]
+            _node_order = ["parse", "financial_report", "data", "news", "rag", "scoring", "risk", "comparison", "report", "reflection"]
             _node_model_map = {}
             for tc in result["tool_calls"]:
                 if tc.get("tool_name") == "llm":
@@ -1123,8 +1155,14 @@ if user_input:
             st.session_state.chat_history.append(AIMessage(content=final_response))
             with st.chat_message("assistant"):
                 st.markdown(final_response)
+                render_reflection(result.get("reflection_result", ""))
                 st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。　　{_model_footer}")
-            st.session_state.messages.append({"role": "assistant", "content": final_response, "model": final_model})
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": final_response,
+                "model": final_model,
+                "reflection_result": result.get("reflection_result", ""),
+            })
 
             status_box.update(label="✅ 分析完成", state="complete", expanded=False)
 
