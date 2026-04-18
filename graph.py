@@ -1463,7 +1463,7 @@ def report_node(state: AgentState) -> dict:
         except Exception as exc:
             err = str(exc)
             # 以下情况 fallback 到 Groq：配额耗尽、限速、服务不可用
-            if any(k in err for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "rate_limit", "rate limit", "over_capacity", "model_overloaded")):
+            if any(k in err for k in ("RESOURCE_EXHAUSTED", "UNAVAILABLE") + RATE_LIMIT_KEYWORDS):
                 response, final_model = call_groq()
                 new_gemini_exhausted = "RESOURCE_EXHAUSTED" in err
             else:
