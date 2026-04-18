@@ -12,9 +12,16 @@ from langchain_groq import ChatGroq
 
 logger = logging.getLogger(__name__)
 
-FAST_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-QUALITY_MODEL = "openai/gpt-oss-120b"
-FALLBACK_MODEL = "openai/gpt-oss-20b"
+TIER_TOP       = "openai/gpt-oss-120b"
+TIER_UPPER_MID = "openai/gpt-oss-20b"
+TIER_MID       = "qwen/qwen3-32b"
+TIER_LOW       = "meta-llama/llama-4-scout-17b-16e-instruct"
+TIER_DEBUG     = "llama-3.1-8b-instant"
+
+QUALITY_CASCADE      = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
+RATE_LIMIT_KEYWORDS  = ("429", "rate_limit", "rate limit", "503", "over_capacity", "model_overloaded")
+MAP_MODEL            = TIER_LOW   # Map 阶段：快速，不级联
+
 CHUNK_TOKENS = 3000  # approximate chars per chunk (1 token ≈ 4 chars → ~12000 chars)
 CHUNK_CHARS = CHUNK_TOKENS * 4
 
@@ -45,21 +52,20 @@ VISION_SYSTEM = """你是财报表格解析助手。图片是财报的一页，�
 {"metrics": {...}, "risks": [], "citations": []}"""
 
 
-def _invoke_groq(messages: list, api_key: str, model: str, temperature: float = 0.1) -> str:
-    """Call Groq with automatic fallback to FALLBACK_MODEL on rate-limit errors."""
-    try:
-        llm = ChatGroq(api_key=api_key, model=model, temperature=temperature)
-        resp = llm.invoke(messages)
-        return _extract_text(resp.content)
-    except Exception as exc:
-        err = str(exc).lower()
-        if model != FALLBACK_MODEL and any(
-            k in err for k in ("429", "rate_limit", "rate limit", "503", "over_capacity", "model_overloaded")
-        ):
-            logger.warning("Groq %s rate-limited, falling back to %s", model, FALLBACK_MODEL)
-            llm_fb = ChatGroq(api_key=api_key, model=FALLBACK_MODEL, temperature=temperature)
-            return _extract_text(llm_fb.invoke(messages).content)
-        raise
+def _invoke_cascade(messages: list, api_key: str, tiers: list, temperature: float = 0.1) -> tuple[str, str]:
+    """Try each model tier in order on rate-limit errors. Returns (text, model_used)."""
+    last_exc: Exception = Exception("no tiers provided")
+    for model in tiers:
+        try:
+            llm = ChatGroq(api_key=api_key, model=model, temperature=temperature)
+            return _extract_text(llm.invoke(messages).content), model
+        except Exception as exc:
+            if any(k in str(exc).lower() for k in RATE_LIMIT_KEYWORDS):
+                logger.warning("Groq %s rate-limited, trying next tier", model)
+                last_exc = exc
+                continue
+            raise
+    raise last_exc
 
 
 def _extract_text(content) -> str:
@@ -124,9 +130,8 @@ def _read_pdf(pdf_path: str) -> tuple[list[str], list]:
 
 
 def _vision_fallback(page, api_key: str) -> Optional[dict]:
-    """Use gpt-oss-120b vision to parse a page image when text extraction fails."""
+    """Use vision-capable model to parse a page image when text extraction fails."""
     try:
-        import pdfplumber
         import PIL.Image
         import io
 
@@ -135,15 +140,19 @@ def _vision_fallback(page, api_key: str) -> Optional[dict]:
         img.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
 
-        llm = ChatGroq(api_key=api_key, model=QUALITY_MODEL, temperature=0.0)
-        resp = llm.invoke([
-            SystemMessage(content=VISION_SYSTEM),
-            HumanMessage(content=[
-                {"type": "text", "text": "请解析此财报页面中的财务数据："},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ]),
-        ])
-        return _parse_json_safe(_extract_text(resp.content))
+        raw, _ = _invoke_cascade(
+            [
+                SystemMessage(content=VISION_SYSTEM),
+                HumanMessage(content=[
+                    {"type": "text", "text": "请解析此财报页面中的财务数据："},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ]),
+            ],
+            api_key,
+            QUALITY_CASCADE,
+            temperature=0.0,
+        )
+        return _parse_json_safe(raw)
     except Exception as exc:
         logger.warning("Vision fallback failed: %s", exc)
         return None
@@ -156,7 +165,8 @@ def _map_chunk(chunk: str, chunk_id: str, api_key: str) -> dict:
         HumanMessage(content=f"[{chunk_id}]\n{chunk}"),
     ]
     try:
-        raw = _invoke_groq(messages, api_key, FAST_MODEL)
+        llm = ChatGroq(api_key=api_key, model=MAP_MODEL, temperature=0.1)
+        raw = _extract_text(llm.invoke(messages).content)
         result = _parse_json_safe(raw)
         if result:
             # Stamp chunk_id on citations
@@ -168,18 +178,18 @@ def _map_chunk(chunk: str, chunk_id: str, api_key: str) -> dict:
     return {"metrics": {}, "risks": [], "citations": []}
 
 
-def _reduce(map_results: list[dict], api_key: str) -> dict:
-    """Merge all chunk results into a final structured summary (Reduce phase)."""
+def _reduce(map_results: list[dict], api_key: str) -> tuple[dict, str]:
+    """Merge all chunk results into a final structured summary (Reduce phase). Returns (result, model_used)."""
     serialized = json.dumps(map_results, ensure_ascii=False)
     messages = [
         SystemMessage(content=REDUCE_SYSTEM),
         HumanMessage(content=f"以下是各分块提取结果（JSON 列表），请合并：\n{serialized}"),
     ]
     try:
-        raw = _invoke_groq(messages, api_key, QUALITY_MODEL)
+        raw, model_used = _invoke_cascade(messages, api_key, QUALITY_CASCADE)
         result = _parse_json_safe(raw)
         if result:
-            return result
+            return result, model_used
     except Exception as exc:
         logger.error("Reduce phase failed: %s", exc)
 
@@ -197,7 +207,7 @@ def _reduce(map_results: list[dict], api_key: str) -> dict:
         "financial_metrics": merged_metrics,
         "risk_signals": list(dict.fromkeys(merged_risks)),
         "report_citations": merged_citations,
-    }
+    }, QUALITY_CASCADE[-1]
 
 
 def financial_report_node(state: dict) -> dict:
@@ -265,12 +275,12 @@ def financial_report_node(state: dict) -> dict:
         map_results.append(result)
 
     # Reduce phase
-    final = _reduce(map_results, api_key)
+    final, reduce_model = _reduce(map_results, api_key)
 
     return {
         "financial_metrics": final.get("financial_metrics"),
         "risk_signals": final.get("risk_signals"),
         "report_citations": final.get("report_citations"),
-        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "financial_report", "model": f"Map:{FAST_MODEL} → Reduce:{QUALITY_MODEL}"}}],
+        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "financial_report", "model": f"Map:{MAP_MODEL} → Reduce:{reduce_model}"}}],
         "errors": errors,
     }

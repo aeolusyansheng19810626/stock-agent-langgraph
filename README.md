@@ -49,19 +49,21 @@ TAVILY_API_KEY=your_tavily_api_key
 ```
 用户提问
    ↓
-parse_node（gpt-oss-120b via Groq）
-  └─ 分析问题，生成调度计划（JSON）
+parse_node（QUALITY_CASCADE）
+  └─ 分析问题，生成调度计划（JSON），含 need_scoring 判断
+   ↓ 条件路由
+   ├─ [条件] financial_report_node → pdfplumber Map + QUALITY_CASCADE Reduce
    ↓ 条件路由（并行）
-   ├─ data_node   → yfinance 获取数据   → LLaMA 技术面分析
-   ├─ news_node   → Tavily 搜索新闻    → LLaMA 新闻摘要+情绪判断
-   └─ rag_node    → ChromaDB 检索财报  → gpt-oss-120b 财务指标提取
-   ↓ fan-in（等待所有节点完成）
-scoring_node（gpt-oss-120b）
-  └─ Chain-of-Thought 多维度评分：财务/情绪/技术 → 综合评级 + 置信度
+   ├─ [条件] data_node   → yfinance 获取数据   → LLaMA 技术面分析
+   ├─ [条件] news_node   → Tavily 搜索新闻    → LLaMA 新闻摘要+情绪判断
+   └─ [条件] rag_node    → ChromaDB 检索财报  → QUALITY_CASCADE 财务指标提取
+   ↓ fan-in
+[条件] scoring_node（QUALITY_CASCADE）
+  └─ need_scoring=true 时才触发，Chain-of-Thought 多维度评分
    ↓
 report_node
-  ├─ 运行模式：Gemini 2.5 Flash（失败时 fallback → Groq）
-  └─ 开发模式：openai/gpt-oss-120b via Groq
+  ├─ 运行模式：Gemini 2.5 Flash（失败时 fallback → Groq QUALITY_CASCADE）
+  └─ 开发模式：Groq QUALITY_CASCADE
 ```
 
 每个中间节点都是真正的 Agent：先调用工具拿到原始数据，再用 LLM 做领域分析，
@@ -75,6 +77,10 @@ class AgentState(TypedDict):
     chat_history_text: str
     tickers: List[str]
     need_data: bool; need_news: bool; need_rag: bool; need_history: bool
+    need_scoring: bool          # 是否需要多维度评分（综合分析=True，简单查价=False）
+    use_financial_report: bool  # 是否触发 financial_report_node
+    pdf_path: Optional[str]
+    financial_metrics: Optional[dict]; risk_signals: Optional[list]; report_citations: Optional[list]
     stock_data: str; news: str; rag_result: str
     scoring_result: dict  # scoring_node 输出的多维度评分 JSON
     report: str; email_status: str; final_model: str
@@ -105,26 +111,29 @@ def route_to_agents(state):
 
 ## 模型配置
 
-所有节点的模型在 `graph.py` 顶部集中配置，改一行即可切换，无需改动节点代码：
+模型采用 **5-tier 级联**，限速时自动降级到下一档，无需手动切换：
 
 ```python
-FAST_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct"
-QUALITY_MODEL = "openai/gpt-oss-120b"
+TIER_TOP       = "openai/gpt-oss-120b"    # 上
+TIER_UPPER_MID = "openai/gpt-oss-20b"     # 上中
+TIER_MID       = "qwen/qwen3-32b"         # 中
+TIER_LOW       = "meta-llama/llama-4-scout-17b-16e-instruct"  # 下（Fast 节点固定用此档）
+TIER_DEBUG     = "llama-3.1-8b-instant"   # 调试
 
-PARSE_MODEL       = QUALITY_MODEL  # parse_node（公司名→ticker 需要世界知识）
-DATA_AGENT_MODEL  = FAST_MODEL     # data_node
-NEWS_AGENT_MODEL  = FAST_MODEL     # news_node
-RAG_AGENT_MODEL   = QUALITY_MODEL  # rag_node（数字/单位处理要求严格）
-SCORING_MODEL     = QUALITY_MODEL  # scoring_node（多维度推理评分）
-REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node（Groq 路径）
+QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 ```
+
+| 节点 | 策略 |
+|------|------|
+| parse / rag / scoring / report(Groq) / financial_report Reduce | QUALITY_CASCADE（上→下依次降级） |
+| data / news / financial_report Map | TIER_LOW 直接调用，不级联 |
 
 ## 双模式运行
 
-| 模式 | parse/data/news/rag | report_node |
-|------|---------------------|-------------|
-| 开发模式（dev_mode=True） | parse/rag: gpt-oss-120b；data/news: LLaMA | openai/gpt-oss-120b |
-| 运行模式（dev_mode=False） | parse/rag: gpt-oss-120b；data/news: LLaMA | Gemini 2.5 Flash → Groq fallback |
+| 模式 | parse/rag/scoring | data/news | report_node |
+|------|-------------------|-----------|-------------|
+| 开发模式（dev_mode=True） | QUALITY_CASCADE | LLaMA | Groq QUALITY_CASCADE |
+| 运行模式（dev_mode=False） | QUALITY_CASCADE | LLaMA | Gemini 2.5 Flash → Groq fallback |
 
 切换：侧边栏「🛠️ 开发模式」toggle
 

@@ -1,6 +1,7 @@
 """LangGraph multi-agent graph for stock analysis."""
 
 import json
+import logging
 import operator
 import os
 import re
@@ -20,17 +21,23 @@ from tools import (
 )
 from nodes import financial_report_node
 
+logger = logging.getLogger(__name__)
 
-FAST_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-QUALITY_MODEL = "openai/gpt-oss-120b"
+# ── 5-tier 模型配置 ───────────────────────────────────────────────────────────
+TIER_TOP       = "openai/gpt-oss-120b"
+TIER_UPPER_MID = "openai/gpt-oss-20b"
+TIER_MID       = "qwen/qwen3-32b"
+TIER_LOW       = "meta-llama/llama-4-scout-17b-16e-instruct"
+TIER_DEBUG     = "llama-3.1-8b-instant"
 
-# ── 各节点模型配置，在这里统一修改，无需改动节点代码 ──────────────────────────
-PARSE_MODEL       = QUALITY_MODEL  # parse_node:  需要世界知识（公司名→ticker映射），用高质量模型
-DATA_AGENT_MODEL  = FAST_MODEL     # data_node:   技术面分析
-NEWS_AGENT_MODEL  = FAST_MODEL     # news_node:   新闻摘要
-RAG_AGENT_MODEL   = QUALITY_MODEL  # rag_node:    财报提取（数字/单位处理要求严格，用高质量模型）
-SCORING_MODEL     = QUALITY_MODEL  # scoring_node: 多维度推理评分，需要推理能力
-REPORT_GROQ_MODEL = QUALITY_MODEL  # report_node: Groq 路径（dev_mode 主力 或 Gemini fallback）
+# Quality 节点从上到下依次降级；Fast 节点直接用 TIER_LOW，不降级
+QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
+
+RATE_LIMIT_KEYWORDS = ("429", "rate_limit", "rate limit", "503", "over_capacity", "model_overloaded")
+
+# Fast 节点（data/news）直接使用的单一模型
+DATA_AGENT_MODEL = TIER_LOW
+NEWS_AGENT_MODEL = TIER_LOW
 # ─────────────────────────────────────────────────────────────────────────────
 
 DATA_AGENT_SYSTEM = """你是一个股票技术面分析助手。
@@ -74,6 +81,7 @@ PLAN_SYSTEM = """你是一个股票分析任务调度器。分析用户问题，
   "news_params": {"query": "Apple latest news 2025"},
   "rag_params": {"query": "Apple revenue earnings Q4"},
   "email_params": null,
+  "need_scoring": false,
   "use_financial_report": false,
   "pdf_path": null
 }
@@ -105,6 +113,9 @@ agents 字段从以下选择（可多选）：data / news / rag / email
   - 用户提到"财报"、"年报"、"10-K"、"20-F"、"上传PDF"、"读财报"或提供文件路径时 → use_financial_report: true
   - 用户提供了文件路径（如 "tmp/xxx.pdf"、"path/to/file.pdf"）→ 提取到 pdf_path 字段
   - use_financial_report 为 true 时，仍需正常填写其他 agents 字段
+  - need_scoring 规则：
+      true  → 用户要求综合分析、投资建议、买卖评级、值不值得买等
+      false → 只查股价、只查新闻、只查某项数据等单一问题
 """
 
 SCORING_SYSTEM = """你是一名资深股票分析师，专注于综合量化评分。你将收到一支股票的技术面数据、新闻情绪和财报信息。
@@ -173,6 +184,7 @@ class AgentState(TypedDict):
     email_params: Optional[dict]
     rag_available: bool
 
+    need_scoring: bool
     pdf_path: Optional[str]
     use_financial_report: bool
     financial_metrics: Optional[dict]
@@ -222,6 +234,22 @@ def _extract_text(content) -> str:
                 parts.append(block)
         return "".join(parts)
     return str(content)
+
+
+def _invoke_with_cascade(messages: list, api_key: str, tiers: list, temperature: float = 0.1) -> tuple[str, str]:
+    """Try each model tier in order on rate-limit errors. Returns (text, model_used)."""
+    last_exc: Exception = Exception("no tiers provided")
+    for model in tiers:
+        try:
+            llm = ChatGroq(api_key=api_key, model=model, temperature=temperature)
+            return _extract_text(llm.invoke(messages).content), model
+        except Exception as exc:
+            if any(k in str(exc).lower() for k in RATE_LIMIT_KEYWORDS):
+                logger.warning("Groq %s rate-limited, trying next tier", model)
+                last_exc = exc
+                continue
+            raise
+    raise last_exc
 
 
 def _extract_tickers(text: str) -> List[str]:
@@ -281,6 +309,9 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
     use_financial_report = any(
         kw in text for kw in ("财报", "年报", "10-k", "20-f", "上传pdf", "读财报")
     )
+    need_scoring = any(
+        kw in text for kw in ("综合", "分析", "建议", "评级", "值不值", "买入", "卖出", "投资")
+    ) or len(agents) >= 2
 
     return {
         "agents": agents,
@@ -292,6 +323,7 @@ def _infer_plan_from_text(user_input: str, rag_available: bool) -> dict:
         "news_params": {"query": user_input} if need_news or agents == ["news"] else None,
         "rag_params": {"query": user_input} if need_rag else None,
         "email_params": None,
+        "need_scoring": need_scoring,
         "use_financial_report": use_financial_report,
         "pdf_path": _extract_pdf_path(user_input),
     }
@@ -338,6 +370,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         email_params = None
 
     use_financial_report = bool(plan.get("use_financial_report", False))
+    need_scoring = bool(plan.get("need_scoring", False))
 
     if not agents:
         return _infer_plan_from_text(user_input, rag_available)
@@ -352,19 +385,17 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         "news_params": {"query": news_query} if "news" in agents else None,
         "rag_params": {"query": rag_query} if "rag" in agents else None,
         "email_params": email_params,
+        "need_scoring": need_scoring,
         "use_financial_report": use_financial_report,
     }
 
 
 def parse_node(state: AgentState) -> dict:
-    groq = ChatGroq(
-        api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-        model=PARSE_MODEL,
-    )
-
+    api_key = state.get("groq_api_key") or os.getenv("GROQ_API_KEY", "")
     history_ctx = state.get("chat_history_text", "")
     planner_error = None
     rag_available = bool(state.get("rag_available", False))
+    model_used = QUALITY_CASCADE[0]
 
     history_prefix = f"History:\n{history_ctx}\n" if history_ctx else ""
     plan_messages = [
@@ -373,8 +404,8 @@ def parse_node(state: AgentState) -> dict:
     ]
 
     try:
-        plan_resp = groq.invoke(plan_messages)
-        raw_plan = _parse_plan(_extract_text(plan_resp.content))
+        raw_text, model_used = _invoke_with_cascade(plan_messages, api_key, QUALITY_CASCADE)
+        raw_plan = _parse_plan(raw_text)
     except Exception as exc:
         planner_error = str(exc)
         raw_plan = _infer_plan_from_text(state["user_input"], rag_available)
@@ -395,9 +426,10 @@ def parse_node(state: AgentState) -> dict:
         "news_query": news_params.get("query", ""),
         "rag_query": rag_params.get("query", ""),
         "email_params": plan.get("email_params"),
+        "need_scoring": bool(plan.get("need_scoring", False)),
         "use_financial_report": bool(plan.get("use_financial_report", False)),
         "pdf_path": plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
-        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": PARSE_MODEL}}],
+        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": model_used}}],
         "errors": [],
     }
 
@@ -569,18 +601,15 @@ def rag_node(state: AgentState) -> dict:
     # LLM post-reasoning: 从检索结果中提炼关键财务信息
     analysis = f"[Document Retrieval]\n{raw_result}"  # 默认 fallback
     try:
-        llm = ChatGroq(
-            api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            model=RAG_AGENT_MODEL,
+        analysis_text, rag_model = _invoke_with_cascade(
+            [SystemMessage(content=RAG_AGENT_SYSTEM), HumanMessage(content=f"检索到的财报段落：\n{raw_result}")],
+            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            QUALITY_CASCADE,
         )
-        resp = llm.invoke([
-            SystemMessage(content=RAG_AGENT_SYSTEM),
-            HumanMessage(content=f"检索到的财报段落：\n{raw_result}"),
-        ])
-        analysis_text = _extract_text(resp.content).strip()
+        analysis_text = analysis_text.strip()
         if analysis_text:
             analysis = f"[财报分析 by rag_agent]\n{analysis_text}\n\n[原始检索结果]\n{raw_result}"
-            tool_calls.append({"tool_name": "llm", "tool_args": {"node": "rag", "model": RAG_AGENT_MODEL}})
+            tool_calls.append({"tool_name": "llm", "tool_args": {"node": "rag", "model": rag_model}})
     except Exception as exc:
         errors.append({
             "node": "rag_node",
@@ -597,6 +626,9 @@ def rag_node(state: AgentState) -> dict:
 
 
 def scoring_node(state: AgentState) -> dict:
+    if not state.get("need_scoring"):
+        return {"scoring_result": {}, "tool_calls": [], "errors": []}
+
     parts = []
     if state.get("stock_data"):
         parts.append(f"[技术面数据]\n{state['stock_data']}")
@@ -618,18 +650,15 @@ def scoring_node(state: AgentState) -> dict:
     context = "\n\n".join(parts)
     errors = []
     scoring = {}
-    raw = ""
+    scoring_model = QUALITY_CASCADE[0]
 
     try:
-        llm = ChatGroq(
-            api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            model=SCORING_MODEL,
+        raw, scoring_model = _invoke_with_cascade(
+            [SystemMessage(content=SCORING_SYSTEM), HumanMessage(content=f"请对以下数据进行多维度评分：\n\n{context}")],
+            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            QUALITY_CASCADE,
         )
-        resp = llm.invoke([
-            SystemMessage(content=SCORING_SYSTEM),
-            HumanMessage(content=f"请对以下数据进行多维度评分：\n\n{context}"),
-        ])
-        raw = _extract_text(resp.content).strip()
+        raw = raw.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
         raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
 
@@ -663,7 +692,7 @@ def scoring_node(state: AgentState) -> dict:
         })
 
     tool_calls = (
-        [{"tool_name": "scoring_agent", "tool_args": {"model": SCORING_MODEL}}]
+        [{"tool_name": "llm", "tool_args": {"node": "scoring", "model": scoring_model}}]
         if scoring else []
     )
     return {"scoring_result": scoring, "tool_calls": tool_calls, "errors": errors}
@@ -751,17 +780,12 @@ def report_node(state: AgentState) -> dict:
     )
     messages = [SystemMessage(content=REPORT_SYSTEM), HumanMessage(content=prompt)]
 
-    def call_groq() -> str:
-        llm = ChatGroq(
-            api_key=groq_api_key,
-            model=REPORT_GROQ_MODEL,
-        )
-        resp = llm.invoke(messages)
-        return _extract_text(resp.content)
+    def call_groq() -> tuple[str, str]:
+        text, model = _invoke_with_cascade(messages, groq_api_key, QUALITY_CASCADE)
+        return text, model
 
     if dev_mode or gemini_exhausted:
-        response = call_groq()
-        final_model = "Groq"
+        response, final_model = call_groq()
         new_gemini_exhausted = False
     else:
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -783,20 +807,18 @@ def report_node(state: AgentState) -> dict:
                 response = text
                 final_model = "Gemini"
             else:
-                response = call_groq()
-                final_model = "Groq"
+                response, final_model = call_groq()
         except Exception as exc:
             err = str(exc)
             # 以下情况 fallback 到 Groq：配额耗尽、限速、服务不可用
             if any(k in err for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")):
-                response = call_groq()
-                final_model = "Groq"
+                response, final_model = call_groq()
                 new_gemini_exhausted = "RESOURCE_EXHAUSTED" in err
             else:
                 raise
 
         if response is None:
-            response = call_groq()
+            response, final_model = call_groq()
 
     email_tool_calls = []
     email_errors = []
