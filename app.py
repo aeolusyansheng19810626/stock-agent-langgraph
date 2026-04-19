@@ -664,6 +664,16 @@ section[data-testid="stSidebar"] {
     border: 1px solid #C7D2FE;
     flex-shrink: 0;
 }
+.tc-name-llm {
+    background: #EEF2FF;
+    color: #4F46E5 !important;
+    border: 1px solid #C7D2FE;
+}
+.tc-name-tool {
+    background: var(--green-lt);
+    color: #0F6E56 !important;
+    border: 1px solid #9FE1CB;
+}
 
 .tc-args {
     font-size: 0.75rem;
@@ -967,11 +977,16 @@ for msg in st.session_state.messages:
             model_label = f"　　由 {msg['model']} 生成" if msg.get("model") else ""
             st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。{model_label}")
     elif role == "tool":
+        _is_llm = msg["tool_name"] == "llm"
+        _tag_cls = "tc-name tc-name-llm" if _is_llm else "tc-name tc-name-tool"
+        _args_str = str(msg["tool_args"])
+        if len(_args_str) > 80:
+            _args_str = _args_str[:80] + "…"
         st.markdown(f"""
         <div class="tool-call-block">
             <span class="tc-step">STEP {msg["step"]}</span>
-            <span class="tc-name">{msg["tool_name"]}</span>
-            <span class="tc-args">{msg["tool_args"]}</span>
+            <span class="{_tag_cls}">{msg["tool_name"]}</span>
+            <span class="tc-args">{_args_str}</span>
             <span class="tc-status">✓ 完成</span>
         </div>
         """, unsafe_allow_html=True)
@@ -1135,7 +1150,19 @@ if user_input:
             # 显示各工具调用步骤
             for i, tc in enumerate(result["tool_calls"], 1):
                 tool_label = TOOL_LABEL.get(tc["tool_name"], tc["tool_name"])
-                st.write(f"🔧 **Step {i}** · `{tc['tool_name']}` — {tc['tool_args']}")
+                _is_llm = tc["tool_name"] == "llm"
+                _tag_cls = "tc-name tc-name-llm" if _is_llm else "tc-name tc-name-tool"
+                _args_str = str(tc["tool_args"])
+                if len(_args_str) > 80:
+                    _args_str = _args_str[:80] + "…"
+                st.markdown(f"""
+                <div class="tool-call-block">
+                    <span class="tc-step">STEP {i}</span>
+                    <span class="{_tag_cls}">{tc['tool_name']}</span>
+                    <span class="tc-args">{_args_str}</span>
+                    <span class="tc-status">✓ 完成</span>
+                </div>
+                """, unsafe_allow_html=True)
                 st.session_state.messages.append({
                     "role": "tool",
                     "step": i,
