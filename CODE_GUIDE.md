@@ -13,6 +13,11 @@
 
 **不包含任何 AI 逻辑，只管显示。**
 
+#### Step 卡片渲染规则
+- `tool_name == "llm"` → 蓝色标签（`.tc-name-llm`）
+- 其他工具调用 → 绿色标签（`.tc-name-tool`）
+- `tool_args` 超过 80 字符时截断并加 `…`，历史消息和实时渲染均适用
+
 ---
 
 ### `graph.py` — AI 大脑（LangGraph 多 Agent 图）
