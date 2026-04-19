@@ -100,6 +100,11 @@ def xxx_node(state: AgentState) -> dict:
 - ❌ 不要在 `_normalize_plan` return 里漏字段（历史上 `need_hypothesis` 因此出过 bug）
 - ❌ 不要改动 `financial_report_node.py` 的 Map-Reduce 结构，除非明确需要
 
+### Token 优化约定（report_node prompt 构建）
+- `stock_data`：只传 `[技术面分析 by data_agent]` 部分，截掉 `[原始数据]` 以下内容（原始数据已由 data_node LLM 提炼，重复传入无意义）
+- `hypothesis_result`：只传 `conclusion` + `scenarios` 一行摘要，不要 `json.dumps` 全量传入（`transmission_chain` / `key_assumptions` 对 report_node 无用）
+- `chat_history_text`：截断到最近 12 行（约 3 轮对话），长对话后 history 线性增长是最大 token 泄漏点
+
 ### 调试 / 自动测试规范
 - 执行自动测试（`test_node.py` / `test_parse.py`）或调试时，**必须先将模型切换为 `TIER_DEBUG`**（`llama-3.1-8b-instant`），避免消耗付费模型额度
 - 测试通过后将模型改回原值，提交时确保代码中不含 `TIER_DEBUG` 的临时赋值

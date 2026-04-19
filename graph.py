@@ -1365,7 +1365,10 @@ def report_node(state: AgentState) -> dict:
             fm_section += f"\n[关键引用]\n{cit_lines}"
         parts.append(fm_section)
     if state.get("stock_data"):
-        parts.append(state["stock_data"])
+        stock_text = state["stock_data"]
+        if "[原始数据]" in stock_text:
+            stock_text = stock_text.split("[原始数据]")[0].strip()
+        parts.append(stock_text)
     if state.get("news"):
         parts.append(state["news"])
     if state.get("rag_result"):
@@ -1406,7 +1409,13 @@ def report_node(state: AgentState) -> dict:
     hypothesis_result = state.get("hypothesis_result") or {}
     hypothesis_prompt_ctx = ""
     if hypothesis_result:
-        hypothesis_prompt_ctx = f"[假设推演结果]\n{json.dumps(hypothesis_result, ensure_ascii=False, indent=2)}\n"
+        h_conclusion = hypothesis_result.get("conclusion", "")
+        h_scenarios = hypothesis_result.get("scenarios", [])
+        scenarios_text = "\n".join(
+            f"- {s.get('name')}（概率{s.get('probability')}%）：{s.get('impact')} 股价影响：{s.get('price_impact')}"
+            for s in h_scenarios
+        )
+        hypothesis_prompt_ctx = f"[假设推演结论]\n{h_conclusion}\n情景：\n{scenarios_text}\n"
 
     error_items = state.get("errors") or []
     error_lines = [
@@ -1415,11 +1424,12 @@ def report_node(state: AgentState) -> dict:
     ]
     error_section = "\n".join(error_lines) if error_lines else "- none"
 
-    history_section = (
-        f"\nHistory:\n{state['chat_history_text']}\n"
-        if state.get("chat_history_text")
-        else ""
-    )
+    if state.get("chat_history_text"):
+        history_lines = state["chat_history_text"].strip().split("\n")
+        truncated = "\n".join(history_lines[-12:])
+        history_section = f"\nHistory（最近3轮）:\n{truncated}\n"
+    else:
+        history_section = ""
     prompt = (
         f"User query: {state['user_input']}\n"
         f"{history_section}\n"

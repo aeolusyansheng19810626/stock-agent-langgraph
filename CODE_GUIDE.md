@@ -89,6 +89,16 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
 Gemini 配额耗尽（RESOURCE_EXHAUSTED）时标记 `gemini_exhausted=True`，后续自动走 Groq。
 
+#### report_node prompt 构建规则（Token 优化）
+
+各节点结果传入 report_node 前会做裁剪，避免重复 token：
+
+| 字段 | 传入内容 | 截掉的部分 |
+|------|---------|-----------|
+| `stock_data` | `[技术面分析 by data_agent]` 部分 | `[原始数据]` 以下（已由 LLM 提炼） |
+| `hypothesis_result` | `conclusion` + `scenarios` 一行摘要 | `transmission_chain` / `key_assumptions` |
+| `chat_history_text` | 最近 12 行（约 3 轮） | 更早的历史轮次 |
+
 ---
 
 ### `tools.py` — 工具层（不要改这个文件）
