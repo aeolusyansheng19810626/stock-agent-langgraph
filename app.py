@@ -10,6 +10,15 @@ from components.stock_ticker import render_stock_ticker
 from dotenv import load_dotenv
 load_dotenv()
 
+# ====== 启动预热：提前加载 HuggingFace embedding 模型，避免首次 search_documents 冷启动 ======
+@st.cache_resource
+def _warmup():
+    from tools import get_embeddings, get_vectorstore
+    get_embeddings()
+    get_vectorstore()
+
+_warmup()
+
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
