@@ -21,6 +21,59 @@ from tools import (
 )
 from nodes import financial_report_node
 
+
+class AgentState(TypedDict):
+    user_input: str
+    chat_history_text: str
+
+    tickers: List[str]
+    need_data: bool
+    need_news: bool
+    need_rag: bool
+    need_history: bool
+    periods: List[str]
+    news_query: str
+    rag_query: str
+    email_params: Optional[dict]
+    rag_available: bool
+
+    need_scoring: bool
+    need_risk: bool
+    need_comparison: bool
+    need_hypothesis: bool
+    need_deep_read: bool
+    need_reflection: bool
+    comparison_dimensions: List[str]
+    pdf_path: Optional[str]
+    use_financial_report: bool
+    financial_metrics: Optional[dict]
+    risk_signals: Optional[list]
+    report_citations: Optional[list]
+
+    tool_calls: Annotated[List[dict], operator.add]
+    errors: Annotated[List[dict], operator.add]
+
+    stock_data: str
+    news: str
+    rag_result: str
+    scoring_result: dict
+    risk_result: Optional[dict]
+    comparison_result: Optional[dict]
+    hypothesis_result: Optional[dict]
+    deep_read_result: Optional[dict]
+    reflection_result: Optional[str]
+
+    report: str
+    final_report: str
+    email_status: str
+    final_model: str
+    gemini_exhausted: bool
+
+    groq_api_key: str
+    gemini_api_key: str
+    dev_mode: bool
+
+
 logger = logging.getLogger(__name__)
 
 # ── 5-tier 模型配置 ───────────────────────────────────────────────────────────
@@ -375,58 +428,6 @@ def deep_read_node(state: AgentState) -> dict:
         tool_calls.append({"tool_name": "llm", "tool_args": {"node": "deep_read", "model": f"S1:{s1_model} S2:{s2_model}"}})
 
     return {"deep_read_result": deep_read_result, "tool_calls": tool_calls, "errors": errors}
-
-
-class AgentState(TypedDict):
-    user_input: str
-    chat_history_text: str
-
-    tickers: List[str]
-    need_data: bool
-    need_news: bool
-    need_rag: bool
-    need_history: bool
-    periods: List[str]
-    news_query: str
-    rag_query: str
-    email_params: Optional[dict]
-    rag_available: bool
-
-    need_scoring: bool
-    need_risk: bool
-    need_comparison: bool
-    need_hypothesis: bool
-    need_deep_read: bool
-    need_reflection: bool
-    comparison_dimensions: List[str]
-    pdf_path: Optional[str]
-    use_financial_report: bool
-    financial_metrics: Optional[dict]
-    risk_signals: Optional[list]
-    report_citations: Optional[list]
-
-    tool_calls: Annotated[List[dict], operator.add]
-    errors: Annotated[List[dict], operator.add]
-
-    stock_data: str
-    news: str
-    rag_result: str
-    scoring_result: dict
-    risk_result: Optional[dict]
-    comparison_result: Optional[dict]
-    hypothesis_result: Optional[dict]
-    deep_read_result: Optional[dict]
-    reflection_result: Optional[str]
-
-    report: str
-    final_report: str
-    email_status: str
-    final_model: str
-    gemini_exhausted: bool
-
-    groq_api_key: str
-    gemini_api_key: str
-    dev_mode: bool
 
 
 def _parse_plan(text: str) -> dict:
