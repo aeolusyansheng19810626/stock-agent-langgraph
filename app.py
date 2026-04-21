@@ -124,9 +124,20 @@ def process_uploaded_pdfs(files):
     from langchain_community.vectorstores import Chroma
     from tools import get_embeddings, VECTORSTORE_DIR, invalidate_vectorstore
 
+    # 确保 ./tmp 目录存在
+    os.makedirs("./tmp", exist_ok=True)
+
     # 磁盘持久化去重（重启后仍有效）
     registry = _load_processed_registry()
     new_files = [f for f in files if f.name not in registry]
+    
+    # 将所有上传的文件都保存到 ./tmp/ 供 financial_report_node 使用
+    for file in files:
+        target_path = os.path.join("./tmp", file.name)
+        if not os.path.exists(target_path):
+            with open(target_path, "wb") as f:
+                f.write(file.getbuffer())
+
     # 同步到 session_state 展示
     st.session_state.processed_docs = registry
     if not new_files:
@@ -144,11 +155,9 @@ def process_uploaded_pdfs(files):
             )
 
         for file in new_files:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(file.read())
-                tmp_path = tmp.name
+            target_path = os.path.join("./tmp", file.name)
             try:
-                loader = PyPDFLoader(tmp_path)
+                loader = PyPDFLoader(target_path)
                 docs = loader.load()
                 chunks = splitter.split_documents(docs)
                 for chunk in chunks:
@@ -163,8 +172,8 @@ def process_uploaded_pdfs(files):
                     vectorstore.add_documents(chunks)
                 registry[file.name] = len(chunks)
                 st.session_state.processed_docs = dict(registry)
-            finally:
-                os.unlink(tmp_path)
+            except Exception as e:
+                st.error(f"处理文件 {file.name} 失败: {e}")
 
         _save_processed_registry(registry)
         invalidate_vectorstore()  # 让 search_documents 重新加载最新向量库
@@ -899,6 +908,8 @@ with st.sidebar:
     )
     if uploaded_files:
         process_uploaded_pdfs(uploaded_files)
+        # 确保 session_state 得到同步
+        st.session_state.processed_docs = _load_processed_registry()
 
     if st.session_state.processed_docs:
         for fname, cnt in st.session_state.processed_docs.items():
@@ -973,6 +984,13 @@ for msg in st.session_state.messages:
     elif role == "assistant":
         with st.chat_message("assistant"):
             st.markdown(msg["content"])
+            if msg.get("errors"):
+                with st.expander("⚠️ 部分节点出现异常，点击查看详情"):
+                    for _err in msg["errors"]:
+                        if isinstance(_err, dict):
+                            st.warning(f"node={_err.get('node','unknown')} | tool={_err.get('tool','unknown')} | message={_err.get('message', str(_err))}")
+                        else:
+                            st.warning(str(_err))
             render_reflection(msg.get("reflection_result", ""))
             model_label = f"　　由 {msg['model']} 生成" if msg.get("model") else ""
             st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。{model_label}")
@@ -1091,12 +1109,15 @@ if user_input:
                 "gemini_api_key":    GEMINI_API_KEY,
                 "dev_mode":          st.session_state.dev_mode,
                 "gemini_exhausted":  st.session_state.gemini_exhausted,
-                "rag_available":     bool(st.session_state.processed_docs),
+                "rag_available":     bool(_load_processed_registry()),
+                "pdf_path":          os.path.join("./tmp", list(st.session_state.processed_docs.keys())[0]) if st.session_state.processed_docs else None,
+                "use_financial_report": bool(st.session_state.processed_docs),
                 "tool_calls":        [],
                 "errors":            [],
             }
 
             _all_tool_calls      = []
+            _all_errors          = []
             _final_report        = ""
             _email_status        = ""
             _final_model         = "Groq"
@@ -1124,6 +1145,8 @@ if user_input:
                     # Accumulate tool calls from each node's delta output
                     if "tool_calls" in _node_output:
                         _all_tool_calls.extend(_node_output["tool_calls"])
+                    if "errors" in _node_output:
+                        _all_errors.extend(_node_output["errors"])
                     if _node_name == "report_node":
                         _final_report         = _node_output.get("final_report") or _node_output.get("report", "")
                         _email_status         = _node_output.get("email_status", "")
@@ -1140,6 +1163,7 @@ if user_input:
                 "final_model":      _final_model,
                 "reflection_result": _reflection_result,
                 "gemini_exhausted": _new_gemini_exhausted,
+                "errors":           _all_errors,
             }
 
             # Gemini 日配额耗尽时更新状态
@@ -1189,17 +1213,6 @@ if user_input:
             _model_footer = " | ".join(_node_model_parts) if _node_model_parts else final_model
 
             st.session_state.chat_history.append(AIMessage(content=final_response))
-            with st.chat_message("assistant"):
-                st.markdown(final_response)
-                render_reflection(result.get("reflection_result", ""))
-                st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。　　{_model_footer}")
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": final_response,
-                "model": final_model,
-                "reflection_result": result.get("reflection_result", ""),
-            })
-
             status_box.update(label="✅ 分析完成", state="complete", expanded=False)
 
         # ====== 显示本次新生成的走势图 ======
@@ -1215,6 +1228,28 @@ if user_input:
                     "content": email_status_text,
                     "sent": email_sent,
                 })
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": final_response,
+            "model": final_model,
+            "reflection_result": result.get("reflection_result", ""),
+            "errors": result.get("errors", []),
+        })
+        with st.chat_message("assistant"):
+            st.markdown(final_response)
+            if result.get("errors"):
+                with st.expander("⚠️ 部分节点出现异常，点击查看详情", expanded=True):
+                    for _err in result["errors"]:
+                        if isinstance(_err, dict):
+                            _node = _err.get("node", "unknown")
+                            _tool = _err.get("tool", "unknown")
+                            _msg = _err.get("message", str(_err))
+                            st.warning(f"node={_node} | tool={_tool} | message={_msg}")
+                        else:
+                            st.warning(str(_err))
+            render_reflection(result.get("reflection_result", ""))
+            st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。　　{_model_footer}")
 
         charts_after = set(glob.glob("charts/*.png"))
         new_charts = sorted(charts_after - charts_before)
