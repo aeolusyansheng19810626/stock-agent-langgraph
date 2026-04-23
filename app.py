@@ -1,7 +1,9 @@
 import os
 import glob
 import json
+import time
 import streamlit as st
+from history import save_history, load_history, clear_history, make_record
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from tools import get_stock_data, search_web, get_stock_history, send_email_report, search_documents
 from components.stock_ticker import render_stock_ticker
@@ -834,6 +836,10 @@ if "dev_mode" not in st.session_state:
     st.session_state.dev_mode = False
 if "processed_docs" not in st.session_state:
     st.session_state.processed_docs = _load_processed_registry()
+if "page" not in st.session_state:
+    st.session_state.page = "chat"
+if "history_clear_confirm" not in st.session_state:
+    st.session_state.history_clear_confirm = False
 
 # ====== 侧边栏 ======
 with st.sidebar:
@@ -867,6 +873,23 @@ with st.sidebar:
     </div>
     <div class="sidebar-divider"></div>
     """, unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+
+    # 页面导航
+    st.markdown('<div class="sidebar-section"><div class="sidebar-section-title">页面</div></div>',
+                unsafe_allow_html=True)
+    _nav_chat = "💬 AI 对话分析"
+    _nav_hist = "📋 历史记录"
+    _nav_choice = st.radio("导航", [_nav_chat, _nav_hist],
+                           index=0 if st.session_state.page == "chat" else 1,
+                           label_visibility="collapsed")
+    if _nav_choice == _nav_hist and st.session_state.page != "history":
+        st.session_state.page = "history"
+        st.rerun()
+    if _nav_choice == _nav_chat and st.session_state.page != "chat":
+        st.session_state.page = "chat"
+        st.rerun()
 
     st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
 
@@ -929,6 +952,52 @@ with st.sidebar:
         ⚠️ 内容仅供参考，不构成投资建议。投资有风险，入市需谨慎。
     </div>
     """, unsafe_allow_html=True)
+
+# ====== 历史记录页 ======
+if st.session_state.page == "history":
+    st.markdown("## 📋 分析历史记录")
+    _records = load_history()[:50]
+
+    col_title, col_btn = st.columns([6, 1])
+    with col_title:
+        st.caption(f"共 {len(_records)} 条记录（最多显示 50 条）")
+    with col_btn:
+        if not st.session_state.history_clear_confirm:
+            if st.button("🗑️ 清空历史", use_container_width=True):
+                st.session_state.history_clear_confirm = True
+                st.rerun()
+        else:
+            st.warning("确认清空全部历史？")
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                if st.button("✅ 确认", use_container_width=True):
+                    clear_history()
+                    st.session_state.history_clear_confirm = False
+                    st.rerun()
+            with _c2:
+                if st.button("❌ 取消", use_container_width=True):
+                    st.session_state.history_clear_confirm = False
+                    st.rerun()
+
+    if not _records:
+        st.info("暂无历史记录。")
+    else:
+        for _rec in _records:
+            _tickers = ", ".join(_rec.get("tickers") or []) or "—"
+            _nodes   = " → ".join(_rec.get("nodes_called") or [])
+            _tu      = _rec.get("token_usage")
+            _tok_str = f"{_tu['total_tokens']:,}" if _tu else "—"
+            _err_tag = "❌ 有错误" if _rec.get("has_error") else "✅ 成功"
+            _elapsed = f"{_rec.get('elapsed_seconds', 0):.1f}s"
+            with st.container(border=True):
+                _r1, _r2 = st.columns([5, 1])
+                with _r1:
+                    st.markdown(f"**{_rec.get('timestamp', '')}**　{_rec.get('user_input', '')[:80]}"
+                                + (f"　({_tickers})" if _tickers != "—" else ""))
+                with _r2:
+                    st.markdown(f"{_err_tag}　{_elapsed}")
+                st.caption(f"节点：{_nodes or '—'}　|　Token：{_tok_str}　|　模型：{_rec.get('final_model','—')}")
+    st.stop()
 
 # ====== 顶部 Header ======
 st.markdown("""
@@ -1082,6 +1151,7 @@ if user_input:
     st.session_state.chat_history.append(HumanMessage(content=user_input))
 
     charts_before = set(glob.glob("charts/*.png"))
+    _run_start = time.time()
 
     try:
         # ====== LangGraph 多 Agent 执行 ======
@@ -1165,6 +1235,16 @@ if user_input:
                 "gemini_exhausted": _new_gemini_exhausted,
                 "errors":           _all_errors,
             }
+
+            save_history(make_record(
+                user_input=user_input,
+                tool_calls=_all_tool_calls,
+                final_model=_final_model,
+                elapsed=round(time.time() - _run_start, 1),
+                has_error=bool(_all_errors),
+                tickers=list({tc.get("tool_args", {}).get("ticker") for tc in _all_tool_calls
+                              if tc.get("tool_name") == "get_stock_data" and tc.get("tool_args", {}).get("ticker")}),
+            ))
 
             # Gemini 日配额耗尽时更新状态
             if result.get("gemini_exhausted"):

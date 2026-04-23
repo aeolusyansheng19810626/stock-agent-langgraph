@@ -343,9 +343,10 @@ def hypothesis_node(state: AgentState) -> dict:
     hypothesis_result = {}
     # 强制使用 TIER_TOP，但会进入 cascade 降级逻辑
     hypothesis_model = TIER_TOP
+    _hyp_usage = None
 
     try:
-        raw, hypothesis_model = _invoke_with_cascade(
+        raw, hypothesis_model, _hyp_usage = _invoke_with_cascade(
             [
                 SystemMessage(content=HYPOTHESIS_SYSTEM),
                 HumanMessage(content=f"背景数据：\n{context}\n\n用户假设请求：{state['user_input']}")
@@ -373,6 +374,8 @@ def hypothesis_node(state: AgentState) -> dict:
         [{"tool_name": "llm", "tool_args": {"node": "hypothesis", "model": hypothesis_model}}]
         if hypothesis_result else []
     )
+    if _hyp_usage:
+        tool_calls.append({"node": "hypothesis", "token_usage": _hyp_usage})
     return {"hypothesis_result": hypothesis_result, "tool_calls": tool_calls, "errors": errors}
 
 
@@ -393,8 +396,9 @@ def deep_read_node(state: AgentState) -> dict:
     # 阶段 1: 摘要与指标提取
     s1_result = {}
     s1_model = QUALITY_CASCADE[0]
+    _s1_usage = None
     try:
-        raw1, s1_model = _invoke_with_cascade(
+        raw1, s1_model, _s1_usage = _invoke_with_cascade(
             [
                 SystemMessage(content=DEEP_READ_STAGE1_SYSTEM),
                 HumanMessage(content=f"内容：\n{context}")
@@ -409,9 +413,10 @@ def deep_read_node(state: AgentState) -> dict:
     # 阶段 2: 批判质疑
     s2_result = {}
     s2_model = TIER_TOP
+    _s2_usage = None
     if s1_result:
         try:
-            raw2, s2_model = _invoke_with_cascade(
+            raw2, s2_model, _s2_usage = _invoke_with_cascade(
                 [
                     SystemMessage(content=DEEP_READ_STAGE2_SYSTEM),
                     HumanMessage(content=f"核心内容：\n{json.dumps(s1_result, ensure_ascii=False)}")
@@ -427,6 +432,13 @@ def deep_read_node(state: AgentState) -> dict:
     tool_calls = []
     if deep_read_result:
         tool_calls.append({"tool_name": "llm", "tool_args": {"node": "deep_read", "model": f"S1:{s1_model} S2:{s2_model}"}})
+    _dr_usage_parts = [u for u in (_s1_usage, _s2_usage) if u]
+    if _dr_usage_parts:
+        tool_calls.append({"node": "deep_read", "token_usage": {
+            "prompt_tokens":     sum(u["prompt_tokens"] for u in _dr_usage_parts),
+            "completion_tokens": sum(u["completion_tokens"] for u in _dr_usage_parts),
+            "total_tokens":      sum(u["total_tokens"] for u in _dr_usage_parts),
+        }})
 
     return {"deep_read_result": deep_read_result, "tool_calls": tool_calls, "errors": errors}
 
@@ -458,13 +470,21 @@ def _extract_text(content) -> str:
     return str(content)
 
 
-def _invoke_with_cascade(messages: list, api_key: str, tiers: list, temperature: float = 0.1) -> tuple[str, str]:
-    """Try each model tier in order on rate-limit errors. Returns (text, model_used)."""
+def _invoke_with_cascade(messages: list, api_key: str, tiers: list, temperature: float = 0.1) -> tuple[str, str, dict | None]:
+    """Try each model tier in order on rate-limit errors. Returns (text, model_used, usage_or_None)."""
     last_exc: Exception = Exception("no tiers provided")
     for model in tiers:
         try:
             llm = ChatGroq(api_key=api_key, model=model, temperature=temperature)
-            return _extract_text(llm.invoke(messages).content), model
+            resp = llm.invoke(messages)
+            text = _extract_text(resp.content)
+            um = getattr(resp, "usage_metadata", None)
+            usage = {
+                "prompt_tokens":     um.get("input_tokens", 0),
+                "completion_tokens": um.get("output_tokens", 0),
+                "total_tokens":      um.get("total_tokens", 0),
+            } if um else None
+            return text, model, usage
         except Exception as exc:
             if any(k in str(exc).lower() for k in RATE_LIMIT_KEYWORDS):
                 logger.warning("Groq %s rate-limited, trying next tier", model)
@@ -711,8 +731,9 @@ def parse_node(state: AgentState) -> dict:
         HumanMessage(content=f"{history_prefix}User query: {state['user_input']}"),
     ]
 
+    _parse_usage = None
     try:
-        raw_text, model_used = _invoke_with_cascade(plan_messages, api_key, QUALITY_CASCADE)
+        raw_text, model_used, _parse_usage = _invoke_with_cascade(plan_messages, api_key, QUALITY_CASCADE)
         raw_plan = _parse_plan(raw_text)
     except Exception as exc:
         planner_error = str(exc)
@@ -743,7 +764,8 @@ def parse_node(state: AgentState) -> dict:
         "need_reflection": bool(plan.get("need_reflection", False)),
         "use_financial_report": state.get("use_financial_report", False) or bool(plan.get("use_financial_report", False)),
         "pdf_path": state.get("pdf_path") or plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
-        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": model_used}}],
+        "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": model_used}}]
+            + ([{"node": "parse", "token_usage": _parse_usage}] if _parse_usage else []),
         "errors": [],
     }
 
@@ -819,6 +841,13 @@ def data_node(state: AgentState) -> dict:
             if analysis_text:
                 analysis = f"[技术面分析 by data_agent]\n{analysis_text}\n\n[原始数据]\n{raw_text}"
                 tool_calls.append({"tool_name": "llm", "tool_args": {"node": "data", "model": DATA_AGENT_MODEL}})
+                _um = getattr(resp, "usage_metadata", None)
+                if _um:
+                    tool_calls.append({"node": "data", "token_usage": {
+                        "prompt_tokens":     _um.get("input_tokens", 0),
+                        "completion_tokens": _um.get("output_tokens", 0),
+                        "total_tokens":      _um.get("total_tokens", 0),
+                    }})
         except Exception as exc:
             errors.append({
                 "node": "data_node",
@@ -875,6 +904,13 @@ def news_node(state: AgentState) -> dict:
         if analysis_text:
             analysis = f"[新闻摘要 by news_agent]\n{analysis_text}\n\n[原始新闻]\n{raw_result}"
             tool_calls.append({"tool_name": "llm", "tool_args": {"node": "news", "model": NEWS_AGENT_MODEL}})
+            _um = getattr(resp, "usage_metadata", None)
+            if _um:
+                tool_calls.append({"node": "news", "token_usage": {
+                    "prompt_tokens":     _um.get("input_tokens", 0),
+                    "completion_tokens": _um.get("output_tokens", 0),
+                    "total_tokens":      _um.get("total_tokens", 0),
+                }})
     except Exception as exc:
         errors.append({
             "node": "news_node",
@@ -910,8 +946,9 @@ def rag_node(state: AgentState) -> dict:
 
     # LLM post-reasoning: 从检索结果中提炼关键财务信息
     analysis = f"[Document Retrieval]\n{raw_result}"  # 默认 fallback
+    _rag_usage = None
     try:
-        analysis_text, rag_model = _invoke_with_cascade(
+        analysis_text, rag_model, _rag_usage = _invoke_with_cascade(
             [SystemMessage(content=RAG_AGENT_SYSTEM), HumanMessage(content=f"检索到的财报段落：\n{raw_result}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             QUALITY_CASCADE,
@@ -920,6 +957,8 @@ def rag_node(state: AgentState) -> dict:
         if analysis_text:
             analysis = f"[财报分析 by rag_agent]\n{analysis_text}\n\n[原始检索结果]\n{raw_result}"
             tool_calls.append({"tool_name": "llm", "tool_args": {"node": "rag", "model": rag_model}})
+            if _rag_usage:
+                tool_calls.append({"node": "rag", "token_usage": _rag_usage})
     except Exception as exc:
         errors.append({
             "node": "rag_node",
@@ -961,9 +1000,10 @@ def scoring_node(state: AgentState) -> dict:
     errors = []
     scoring = {}
     scoring_model = QUALITY_CASCADE[0]
+    _scoring_usage = None
 
     try:
-        raw, scoring_model = _invoke_with_cascade(
+        raw, scoring_model, _scoring_usage = _invoke_with_cascade(
             [SystemMessage(content=SCORING_SYSTEM), HumanMessage(content=f"请对以下数据进行多维度评分：\n\n{context}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             QUALITY_CASCADE,
@@ -1005,6 +1045,8 @@ def scoring_node(state: AgentState) -> dict:
         [{"tool_name": "llm", "tool_args": {"node": "scoring", "model": scoring_model}}]
         if scoring else []
     )
+    if _scoring_usage:
+        tool_calls.append({"node": "scoring", "token_usage": _scoring_usage})
     return {"scoring_result": scoring, "tool_calls": tool_calls, "errors": errors}
 
 
@@ -1027,9 +1069,10 @@ def risk_node(state: AgentState) -> dict:
     errors = []
     risk_result = {}
     risk_model = TIER_TOP
+    _risk_usage = None
 
     try:
-        raw, risk_model = _invoke_with_cascade(
+        raw, risk_model, _risk_usage = _invoke_with_cascade(
             [SystemMessage(content=RISK_SYSTEM), HumanMessage(content=f"请分析以下数据中的风险：\n\n{context}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             RISK_MODEL_CASCADE,
@@ -1071,6 +1114,8 @@ def risk_node(state: AgentState) -> dict:
         [{"tool_name": "llm", "tool_args": {"node": "risk", "model": risk_model}}]
         if risk_result else []
     )
+    if _risk_usage:
+        tool_calls.append({"node": "risk", "token_usage": _risk_usage})
     return {"risk_result": risk_result, "tool_calls": tool_calls, "errors": errors}
 
 
@@ -1097,9 +1142,10 @@ def comparison_node(state: AgentState) -> dict:
     errors = []
     comparison_result = {}
     comparison_model = TIER_TOP
+    _cmp_usage = None
 
     try:
-        raw, comparison_model = _invoke_with_cascade(
+        raw, comparison_model, _cmp_usage = _invoke_with_cascade(
             [SystemMessage(content=COMPARISON_SYSTEM), HumanMessage(content=f"请对以下股票进行逐项对比：\n\n{context}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             COMPARISON_MODEL_CASCADE,
@@ -1141,6 +1187,8 @@ def comparison_node(state: AgentState) -> dict:
         [{"tool_name": "llm", "tool_args": {"node": "comparison", "model": comparison_model}}]
         if comparison_result else []
     )
+    if _cmp_usage:
+        tool_calls.append({"node": "comparison", "token_usage": _cmp_usage})
     return {"comparison_result": comparison_result, "tool_calls": tool_calls, "errors": errors}
 
 
@@ -1451,13 +1499,15 @@ def report_node(state: AgentState) -> dict:
     )
     messages = [SystemMessage(content=REPORT_SYSTEM), HumanMessage(content=prompt)]
 
-    def call_groq() -> tuple[str, str]:
-        text, model = _invoke_with_cascade(messages, groq_api_key, QUALITY_CASCADE)
-        return text, model
+    _report_usage = None
+
+    def call_groq() -> tuple[str, str, dict | None]:
+        text, model, usage = _invoke_with_cascade(messages, groq_api_key, QUALITY_CASCADE)
+        return text, model, usage
 
     if dev_mode or gemini_exhausted:
         try:
-            response, final_model = call_groq()
+            response, final_model, _report_usage = call_groq()
             if not response.strip():
                 response = "⚠️ 报告生成失败：模型返回空响应，请重试。"
                 final_model = "none"
@@ -1484,19 +1534,26 @@ def report_node(state: AgentState) -> dict:
             if text.strip():
                 response = text
                 final_model = "Gemini"
+                _um = getattr(resp, "usage_metadata", None)
+                if _um:
+                    _report_usage = {
+                        "prompt_tokens":     _um.get("input_tokens", 0),
+                        "completion_tokens": _um.get("output_tokens", 0),
+                        "total_tokens":      _um.get("total_tokens", 0),
+                    }
             else:
-                response, final_model = call_groq()
+                response, final_model, _report_usage = call_groq()
         except Exception as exc:
             err = str(exc)
             # 以下情况 fallback 到 Groq：配额耗尽、限速、服务不可用
             if any(k in err for k in ("RESOURCE_EXHAUSTED", "UNAVAILABLE") + RATE_LIMIT_KEYWORDS):
-                response, final_model = call_groq()
+                response, final_model, _report_usage = call_groq()
                 new_gemini_exhausted = "RESOURCE_EXHAUSTED" in err
             else:
                 raise
 
         if response is None:
-            response, final_model = call_groq()
+            response, final_model, _report_usage = call_groq()
 
     comparison_section = _format_comparison_section(state.get("comparison_result"))
     if comparison_section:
@@ -1563,13 +1620,14 @@ def report_node(state: AgentState) -> dict:
             email_status = f"Not sent. {exc}"
 
     report_model_record = {"tool_name": "llm", "tool_args": {"node": "report", "model": final_model}}
+    _report_token_entry = [{"node": "report", "token_usage": _report_usage}] if _report_usage else []
     return {
         "report": response,
         "final_report": response,
         "email_status": email_status,
         "final_model": final_model,
         "gemini_exhausted": new_gemini_exhausted,
-        "tool_calls": [report_model_record] + email_tool_calls,
+        "tool_calls": [report_model_record] + _report_token_entry + email_tool_calls,
         "errors": email_errors,
     }
 
@@ -1585,9 +1643,10 @@ def reflection_node(state: AgentState) -> dict:
         }
 
     reflection_model = TIER_TOP
+    _ref_usage = None
     errors = []
     try:
-        raw, reflection_model = _invoke_with_cascade(
+        raw, reflection_model, _ref_usage = _invoke_with_cascade(
             [SystemMessage(content=REFLECTION_SYSTEM), HumanMessage(content=f"股票分析报告：\n\n{report}")],
             state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             REFLECTION_MODEL_CASCADE,
@@ -1618,10 +1677,13 @@ def reflection_node(state: AgentState) -> dict:
             "severity": parsed.get("severity", ""),
             "revised_sections": parsed.get("revised_sections", ""),
         }
+        _ref_tc = [{"tool_name": "llm", "tool_args": {"node": "reflection", "model": reflection_model}}]
+        if _ref_usage:
+            _ref_tc.append({"node": "reflection", "token_usage": _ref_usage})
         return {
             "final_report": str(revised_report),
             "reflection_result": json.dumps(reflection_payload, ensure_ascii=False),
-            "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "reflection", "model": reflection_model}}],
+            "tool_calls": _ref_tc,
             "errors": [],
         }
     except Exception as exc:
