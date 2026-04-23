@@ -89,6 +89,9 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
 RATE_LIMIT_KEYWORDS = ("429", "rate_limit", "rate limit", "503", "over_capacity", "model_overloaded")
 
+# Streaming callback injected by app.py before each report generation; None = no streaming
+_report_streaming_cb = None
+
 # Fast 节点（data/news）直接使用的单一模型
 DATA_AGENT_MODEL = TIER_LOW
 NEWS_AGENT_MODEL = TIER_LOW
@@ -492,6 +495,25 @@ def _invoke_with_cascade(messages: list, api_key: str, tiers: list, temperature:
                 continue
             raise
     raise last_exc
+
+
+def _stream_with_cb(llm_obj, messages: list, cb) -> tuple[str, dict | None]:
+    """Stream llm_obj token-by-token, calling cb(token) for each non-empty chunk. Returns (full_text, usage_or_None)."""
+    full = ""
+    last_chunk = None
+    for chunk in llm_obj.stream(messages):
+        token = getattr(chunk, "content", "") or ""
+        full += token
+        if token:
+            cb(token)
+        last_chunk = chunk
+    um = getattr(last_chunk, "usage_metadata", None) if last_chunk else None
+    usage = {
+        "prompt_tokens":     um.get("input_tokens", 0),
+        "completion_tokens": um.get("output_tokens", 0),
+        "total_tokens":      um.get("total_tokens", 0),
+    } if um else None
+    return full, usage
 
 
 def _extract_tickers(text: str) -> List[str]:
@@ -1502,6 +1524,20 @@ def report_node(state: AgentState) -> dict:
     _report_usage = None
 
     def call_groq() -> tuple[str, str, dict | None]:
+        _cb = _report_streaming_cb
+        if _cb:
+            _last_exc: Exception = Exception("no tiers provided")
+            for _m in QUALITY_CASCADE:
+                try:
+                    _llm = ChatGroq(api_key=groq_api_key, model=_m, temperature=0.1)
+                    _txt, _usg = _stream_with_cb(_llm, messages, _cb)
+                    return _txt, _m, _usg
+                except Exception as _exc:
+                    if any(k in str(_exc).lower() for k in RATE_LIMIT_KEYWORDS):
+                        _last_exc = _exc
+                        continue
+                    raise
+            raise _last_exc
         text, model, usage = _invoke_with_cascade(messages, groq_api_key, QUALITY_CASCADE)
         return text, model, usage
 
@@ -1528,19 +1564,23 @@ def report_node(state: AgentState) -> dict:
             temperature=0.1,
         )
 
+        _cb_gem = _report_streaming_cb
         try:
-            resp = gemini_llm.invoke(messages)
-            text = _extract_text(resp.content)
+            if _cb_gem:
+                text, _gem_usage = _stream_with_cb(gemini_llm, messages, _cb_gem)
+            else:
+                resp = gemini_llm.invoke(messages)
+                text = _extract_text(resp.content)
+                _um = getattr(resp, "usage_metadata", None)
+                _gem_usage = {
+                    "prompt_tokens":     _um.get("input_tokens", 0),
+                    "completion_tokens": _um.get("output_tokens", 0),
+                    "total_tokens":      _um.get("total_tokens", 0),
+                } if _um else None
             if text.strip():
                 response = text
                 final_model = "Gemini"
-                _um = getattr(resp, "usage_metadata", None)
-                if _um:
-                    _report_usage = {
-                        "prompt_tokens":     _um.get("input_tokens", 0),
-                        "completion_tokens": _um.get("output_tokens", 0),
-                        "total_tokens":      _um.get("total_tokens", 0),
-                    }
+                _report_usage = _gem_usage
             else:
                 response, final_model, _report_usage = call_groq()
         except Exception as exc:
@@ -1554,6 +1594,8 @@ def report_node(state: AgentState) -> dict:
 
         if response is None:
             response, final_model, _report_usage = call_groq()
+
+    _llm_response = response  # capture before structural sections are appended
 
     comparison_section = _format_comparison_section(state.get("comparison_result"))
     if comparison_section:
@@ -1570,6 +1612,10 @@ def report_node(state: AgentState) -> dict:
     deep_read_section = _format_deep_read_section(state.get("deep_read_result"))
     if deep_read_section:
         response = f"{response.rstrip()}\n\n{deep_read_section}"
+
+    # Push any appended structural sections to streaming callback
+    if _report_streaming_cb and len(response) > len(_llm_response.rstrip()):
+        _report_streaming_cb(response[len(_llm_response.rstrip()):])
 
     email_tool_calls = []
     email_errors = []

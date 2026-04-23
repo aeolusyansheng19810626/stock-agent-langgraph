@@ -1171,170 +1171,211 @@ if user_input:
                 _role = "用户" if _cls == "HumanMessage" else "助手"
                 chat_history_text += f"{_role}: {str(_msg.content)[:300]}\n"
 
-        with st.status("AI 正在分析…", expanded=True) as status_box:
-            _initial_state = {
-                "user_input":        user_input,
-                "chat_history_text": chat_history_text,
-                "groq_api_key":      GROQ_API_KEY,
-                "gemini_api_key":    GEMINI_API_KEY,
-                "dev_mode":          st.session_state.dev_mode,
-                "gemini_exhausted":  st.session_state.gemini_exhausted,
-                "rag_available":     bool(_load_processed_registry()),
-                "pdf_path":          os.path.join("./tmp", list(st.session_state.processed_docs.keys())[0]) if st.session_state.processed_docs else None,
-                "use_financial_report": bool(st.session_state.processed_docs),
-                "tool_calls":        [],
-                "errors":            [],
-            }
+        import queue as _queue_mod
+        import threading as _threading_mod
+        try:
+            from streamlit.runtime.scriptrunner import (
+                add_script_run_ctx as _st_add_ctx,
+                get_script_run_ctx as _st_get_ctx,
+            )
+            _ST_CTX_OK = True
+        except ImportError:
+            _ST_CTX_OK = False
+        import graph as _graph_mod
 
-            _all_tool_calls      = []
-            _all_errors          = []
-            _final_report        = ""
-            _email_status        = ""
-            _final_model         = "Groq"
-            _reflection_result   = ""
-            _new_gemini_exhausted = False
+        _token_q        = _queue_mod.Queue()
+        _all_tool_calls = []
+        _all_errors     = []
+        _g              = {}
+        _exc_h          = [None]
+        _dev_mode_snap  = st.session_state.dev_mode
+        _gem_ex_snap    = st.session_state.gemini_exhausted
 
-            for _update in _load_graph().stream(_initial_state, stream_mode="updates"):
-                for _node_name, _node_output in _update.items():
-                    # Real-time status updates
-                    if _node_name == "parse_node":
-                        status_box.update(label="正在分析问题，制定调度计划…")
-                    elif _node_name == "data_node" and _node_output.get("stock_data"):
-                        status_box.update(label="正在获取股票数据…")
-                    elif _node_name == "news_node" and _node_output.get("news"):
-                        status_box.update(label="正在搜索最新新闻…")
-                    elif _node_name == "rag_node" and _node_output.get("rag_result"):
-                        status_box.update(label="正在检索财报文档…")
-                    elif _node_name == "report_node":
-                        _model_label = "Groq" if (
-                            st.session_state.dev_mode or st.session_state.gemini_exhausted
-                        ) else "Gemini"
-                        status_box.update(label=f"正在生成分析报告（{_model_label}）…")
-                    elif _node_name == "reflection_node":
-                        status_box.update(label="正在进行自我反思与修订…")
-                    # Accumulate tool calls from each node's delta output
-                    if "tool_calls" in _node_output:
-                        _all_tool_calls.extend(_node_output["tool_calls"])
-                    if "errors" in _node_output:
-                        _all_errors.extend(_node_output["errors"])
-                    if _node_name == "report_node":
-                        _final_report         = _node_output.get("final_report") or _node_output.get("report", "")
-                        _email_status         = _node_output.get("email_status", "")
-                        _final_model          = _node_output.get("final_model", "Groq")
-                        _new_gemini_exhausted = _node_output.get("gemini_exhausted", False)
-                    elif _node_name == "reflection_node":
-                        _final_report       = _node_output.get("final_report", _final_report)
-                        _reflection_result = _node_output.get("reflection_result") or ""
+        _initial_state = {
+            "user_input":           user_input,
+            "chat_history_text":    chat_history_text,
+            "groq_api_key":         GROQ_API_KEY,
+            "gemini_api_key":       GEMINI_API_KEY,
+            "dev_mode":             _dev_mode_snap,
+            "gemini_exhausted":     _gem_ex_snap,
+            "rag_available":        bool(_load_processed_registry()),
+            "pdf_path":             os.path.join("./tmp", list(st.session_state.processed_docs.keys())[0]) if st.session_state.processed_docs else None,
+            "use_financial_report": bool(st.session_state.processed_docs),
+            "tool_calls":           [],
+            "errors":               [],
+        }
 
-            result = {
-                "tool_calls":       _all_tool_calls,
-                "final_response":   _final_report,
-                "email_status":     _email_status,
-                "final_model":      _final_model,
-                "reflection_result": _reflection_result,
-                "gemini_exhausted": _new_gemini_exhausted,
-                "errors":           _all_errors,
-            }
+        _status   = st.status("AI 正在分析…", expanded=True)
+        _steps_ph = st.empty()   # placeholder: step cards fill here BEFORE chat_message, matching rerun order
 
-            save_history(make_record(
-                user_input=user_input,
-                tool_calls=_all_tool_calls,
-                final_model=_final_model,
-                elapsed=round(time.time() - _run_start, 1),
-                has_error=bool(_all_errors),
-                tickers=list({tc.get("tool_args", {}).get("ticker") for tc in _all_tool_calls
-                              if tc.get("tool_name") == "get_stock_data" and tc.get("tool_args", {}).get("ticker")}),
-            ))
-
-            # Gemini 日配额耗尽时更新状态
-            if result.get("gemini_exhausted"):
-                st.session_state.gemini_exhausted = True
-                st.warning("Gemini 日配额已用完，已切换至 Groq 模式（下午 4 点后点击侧边栏按钮恢复）")
-
-            # 显示各工具调用步骤
-            for i, tc in enumerate(result["tool_calls"], 1):
-                tool_label = TOOL_LABEL.get(tc["tool_name"], tc["tool_name"])
-                _is_llm = tc["tool_name"] == "llm"
-                _tag_cls = "tc-name tc-name-llm" if _is_llm else "tc-name tc-name-tool"
-                _args_str = str(tc["tool_args"])
-                if len(_args_str) > 80:
-                    _args_str = _args_str[:80] + "…"
-                st.markdown(f"""
-                <div class="tool-call-block">
-                    <span class="tc-step">STEP {i}</span>
-                    <span class="{_tag_cls}">{tc['tool_name']}</span>
-                    <span class="tc-args">{_args_str}</span>
-                    <span class="tc-status">✓ 完成</span>
-                </div>
-                """, unsafe_allow_html=True)
-                st.session_state.messages.append({
-                    "role": "tool",
-                    "step": i,
-                    "tool_name": tc["tool_name"],
-                    "tool_args": tc["tool_args"],
-                    "content": "",
+        def _graph_worker():
+            try:
+                _fr, _es, _fm, _rr, _nge = "", "", "Groq", "", False
+                for _upd in _load_graph().stream(_initial_state, stream_mode="updates"):
+                    for _nn, _no in _upd.items():
+                        if _nn == "parse_node":
+                            _status.update(label="正在分析问题，制定调度计划…")
+                        elif _nn == "data_node" and _no.get("stock_data"):
+                            _status.update(label="正在获取股票数据…")
+                        elif _nn == "news_node" and _no.get("news"):
+                            _status.update(label="正在搜索最新新闻…")
+                        elif _nn == "rag_node" and _no.get("rag_result"):
+                            _status.update(label="正在检索财报文档…")
+                        elif _nn == "report_node":
+                            _ml = "Groq" if (_dev_mode_snap or _gem_ex_snap) else "Gemini"
+                            _status.update(label=f"正在生成分析报告（{_ml}）…")
+                        elif _nn == "reflection_node":
+                            _status.update(label="正在进行自我反思与修订…")
+                        if "tool_calls" in _no:
+                            _all_tool_calls.extend(_no["tool_calls"])
+                        if "errors" in _no:
+                            _all_errors.extend(_no["errors"])
+                        if _nn == "report_node":
+                            _fr  = _no.get("final_report") or _no.get("report", "")
+                            _es  = _no.get("email_status", "")
+                            _fm  = _no.get("final_model", "Groq")
+                            _nge = _no.get("gemini_exhausted", False)
+                        elif _nn == "reflection_node":
+                            _fr = _no.get("final_report", _fr)
+                            _rr = _no.get("reflection_result") or ""
+                _g.update({
+                    "final_report":      _fr,
+                    "email_status":      _es,
+                    "final_model":       _fm,
+                    "reflection_result": _rr,
+                    "gemini_exhausted":  _nge,
                 })
+            except Exception as _e:
+                _exc_h[0] = _e
+            finally:
+                _graph_mod._report_streaming_cb = None
+                _token_q.put(None)
 
-            final_response = result["final_response"]
-            final_model    = result["final_model"]
+        _graph_mod._report_streaming_cb = lambda t: _token_q.put(t)
 
-            # 从 tool_calls 里提取各节点模型记录，拼成 footer
+        if _ST_CTX_OK:
+            _srt_ctx = _st_get_ctx()
+            def _worker_with_ctx():
+                _st_add_ctx(_threading_mod.current_thread(), _srt_ctx)
+                _graph_worker()
+            _thread = _threading_mod.Thread(target=_worker_with_ctx, daemon=True)
+        else:
+            _thread = _threading_mod.Thread(target=_graph_worker, daemon=True)
+
+        _thread.start()
+
+        def _tok_gen():
+            while True:
+                _t = _token_q.get()
+                if _t is None:
+                    break
+                yield _t
+
+        with st.chat_message("assistant"):
+            _streamed_text = st.write_stream(_tok_gen())
+            _thread.join()
+            if _exc_h[0] is not None:
+                raise _exc_h[0]
+
+            final_response     = _g.get("final_report") or _streamed_text
+            final_model        = _g.get("final_model", "Groq")
+            _reflection_result = _g.get("reflection_result", "")
+
+            if _all_errors:
+                with st.expander("⚠️ 部分节点出现异常，点击查看详情", expanded=True):
+                    for _err in _all_errors:
+                        if isinstance(_err, dict):
+                            _nd = _err.get("node", "unknown")
+                            _tl = _err.get("tool", "unknown")
+                            _ms = _err.get("message", str(_err))
+                            st.warning(f"node={_nd} | tool={_tl} | message={_ms}")
+                        else:
+                            st.warning(str(_err))
+
+            render_reflection(_reflection_result)
+
             _node_model_parts = []
-            _node_order = ["parse", "financial_report", "data", "news", "rag", "scoring", "risk", "comparison", "report", "reflection"]
-            _node_model_map = {}
-            for tc in result["tool_calls"]:
+            _node_order       = ["parse", "financial_report", "data", "news", "rag", "scoring", "risk", "comparison", "report", "reflection"]
+            _node_model_map   = {}
+            for tc in _all_tool_calls:
                 if tc.get("tool_name") == "llm":
-                    n = tc["tool_args"].get("node", "")
-                    m = tc["tool_args"].get("model", "")
-                    _node_model_map[n] = m
+                    _node_model_map[tc["tool_args"].get("node", "")] = tc["tool_args"].get("model", "")
             for _n in _node_order:
                 if _n in _node_model_map:
                     _node_model_parts.append(f"{_n}: {_node_model_map[_n]}")
             _model_footer = " | ".join(_node_model_parts) if _node_model_parts else final_model
-
-            st.session_state.chat_history.append(AIMessage(content=final_response))
-            status_box.update(label="✅ 分析完成", state="complete", expanded=False)
-
-        # ====== 显示本次新生成的走势图 ======
-            if result.get("email_status"):
-                email_status_text = result["email_status"]
-                email_sent = email_status_text.startswith("Sent to ")
-                if email_sent:
-                    st.success(f"Email: {email_status_text}")
-                else:
-                    st.error(f"Email: {email_status_text}")
-                st.session_state.messages.append({
-                    "role": "email_status",
-                    "content": email_status_text,
-                    "sent": email_sent,
-                })
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": final_response,
-            "model": final_model,
-            "reflection_result": result.get("reflection_result", ""),
-            "errors": result.get("errors", []),
-        })
-        with st.chat_message("assistant"):
-            st.markdown(final_response)
-            if result.get("errors"):
-                with st.expander("⚠️ 部分节点出现异常，点击查看详情", expanded=True):
-                    for _err in result["errors"]:
-                        if isinstance(_err, dict):
-                            _node = _err.get("node", "unknown")
-                            _tool = _err.get("tool", "unknown")
-                            _msg = _err.get("message", str(_err))
-                            st.warning(f"node={_node} | tool={_tool} | message={_msg}")
-                        else:
-                            st.warning(str(_err))
-            render_reflection(result.get("reflection_result", ""))
             st.caption(f"⚠️ 以上内容仅供参考，不构成投资建议。　　{_model_footer}")
 
+        _status.update(label="✅ 分析完成", state="complete", expanded=False)
+
+        _email_status         = _g.get("email_status", "")
+        _new_gemini_exhausted = _g.get("gemini_exhausted", False)
+
+        save_history(make_record(
+            user_input=user_input,
+            tool_calls=_all_tool_calls,
+            final_model=final_model,
+            elapsed=round(time.time() - _run_start, 1),
+            has_error=bool(_all_errors),
+            tickers=list({tc.get("tool_args", {}).get("ticker") for tc in _all_tool_calls
+                          if tc.get("tool_name") == "get_stock_data" and tc.get("tool_args", {}).get("ticker")}),
+        ))
+
+        if _new_gemini_exhausted:
+            st.session_state.gemini_exhausted = True
+            st.warning("Gemini 日配额已用完，已切换至 Groq 模式（下午 4 点后点击侧边栏按钮恢复）")
+
+        # ====== 显示本次新生成的走势图 ======
+        if _email_status:
+            _email_sent = _email_status.startswith("Sent to ")
+            if _email_sent:
+                st.success(f"Email: {_email_status}")
+            else:
+                st.error(f"Email: {_email_status}")
+            st.session_state.messages.append({
+                "role":    "email_status",
+                "content": _email_status,
+                "sent":    _email_sent,
+            })
+
+        # 显示各工具调用步骤（写入占位符，使其出现在 chat_message 上方，与 rerun 后顺序一致）
+        _steps_html_parts = []
+        for i, tc in enumerate((t for t in _all_tool_calls if "tool_name" in t), 1):
+            tool_label = TOOL_LABEL.get(tc["tool_name"], tc["tool_name"])
+            _is_llm    = tc["tool_name"] == "llm"
+            _tag_cls   = "tc-name tc-name-llm" if _is_llm else "tc-name tc-name-tool"
+            _args_str  = str(tc["tool_args"])
+            if len(_args_str) > 80:
+                _args_str = _args_str[:80] + "…"
+            _steps_html_parts.append(f"""<div class="tool-call-block">
+                <span class="tc-step">STEP {i}</span>
+                <span class="{_tag_cls}">{tc['tool_name']}</span>
+                <span class="tc-args">{_args_str}</span>
+                <span class="tc-status">✓ 完成</span>
+            </div>""")
+            st.session_state.messages.append({
+                "role":      "tool",
+                "step":      i,
+                "tool_name": tc["tool_name"],
+                "tool_args": tc["tool_args"],
+                "content":   "",
+            })
+        if _steps_html_parts:
+            _steps_ph.markdown("\n".join(_steps_html_parts), unsafe_allow_html=True)
+
+        st.session_state.chat_history.append(AIMessage(content=final_response))
+        st.session_state.messages.append({
+            "role":              "assistant",
+            "content":           final_response,
+            "model":             final_model,
+            "reflection_result": _reflection_result,
+            "errors":            _all_errors,
+        })
+
         charts_after = set(glob.glob("charts/*.png"))
-        new_charts = sorted(charts_after - charts_before)
+        new_charts   = sorted(charts_after - charts_before)
         for chart_path in new_charts:
-            ticker = os.path.basename(chart_path).split("_")[0]
+            ticker  = os.path.basename(chart_path).split("_")[0]
             caption = f"{ticker} 历史走势图"
             st.markdown(f"""
             <div class="chart-card">
@@ -1348,7 +1389,7 @@ if user_input:
             st.image(chart_path, use_container_width=True)
             st.markdown("</div></div>", unsafe_allow_html=True)
             st.session_state.messages.append({
-                "role": "chart",
+                "role":    "chart",
                 "content": chart_path,
                 "caption": caption,
             })

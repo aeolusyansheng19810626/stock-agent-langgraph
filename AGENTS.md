@@ -100,14 +100,29 @@ def xxx_node(state: AgentState) -> dict:
 - ❌ 不要在 `_normalize_plan` return 里漏字段（历史上 `need_hypothesis` 因此出过 bug）
 - ❌ 不要改动 `financial_report_node.py` 的 Map-Reduce 结构，除非明确需要
 
+### 流式输出（report_node）
+- `graph.py` 模块级变量 `_report_streaming_cb = None`，由 `app.py` 在每次运行前注入 `lambda t: token_q.put(t)`，`report_node` 结束后置回 `None`
+- `_stream_with_cb(llm_obj, messages, cb)` 辅助函数兼容 Gemini / Groq，逐 chunk 调用 cb
+- `call_groq()` 和 Gemini 路径均检测 cb 是否非 None，有则走 `llm.stream()`，否则退回 `llm.invoke()`
+- 追加的结构化段落（comparison / risk_matrix 等）在主体生成后计算差量，一并 push 到 cb
+- `app.py` 在 `st.chat_message()` 之前创建 `_steps_ph = st.empty()` 占位符；流式结束后将所有步骤卡片 HTML 合并为单次 `_steps_ph.markdown()` 调用，确保布局不跳动
+
 ### Token 优化约定（report_node prompt 构建）
 - `stock_data`：只传 `[技术面分析 by data_agent]` 部分，截掉 `[原始数据]` 以下内容（原始数据已由 data_node LLM 提炼，重复传入无意义）
 - `hypothesis_result`：只传 `conclusion` + `scenarios` 一行摘要，不要 `json.dumps` 全量传入（`transmission_chain` / `key_assumptions` 对 report_node 无用）
 - `chat_history_text`：截断到最近 12 行（约 3 轮对话），长对话后 history 线性增长是最大 token 泄漏点
 
 ### 调试 / 自动测试规范
-- 执行自动测试（`test_node.py` / `test_parse.py`）或调试时，**必须先将模型切换为 `TIER_DEBUG`**（`llama-3.1-8b-instant`），避免消耗付费模型额度
-- 测试通过后将模型改回原值，提交时确保代码中不含 `TIER_DEBUG` 的临时赋值
+- 测试时写临时脚本（如 `test_stream.py`），在 `import graph` 后立即 patch 所有模型变量为 `TIER_DEBUG`，运行后删除脚本：
+  ```python
+  import graph as G
+  _D = G.TIER_DEBUG
+  G.QUALITY_CASCADE = [_D]; G.DATA_AGENT_MODEL = _D; G.NEWS_AGENT_MODEL = _D
+  G.RISK_MODEL_CASCADE = [_D]; G.COMPARISON_MODEL_CASCADE = [_D]
+  G.REFLECTION_MODEL_CASCADE = [_D]; G.DEEP_READ_S1_CASCADE = [_D]; G.DEEP_READ_S2_CASCADE = [_D]
+  ```
+- patch 只在进程内生效，不会污染 graph.py 源文件
+- 提交前确认 graph.py 中无残留的 `TIER_DEBUG` 临时赋值
 
 ### Commit 规范
 commit message 必须包含修改者名字和修改内容摘要：
@@ -128,16 +143,13 @@ TAVILY_API_KEY=
 ```
 Gmail 发送用 OAuth，首次运行生成 `token.pickle`，无需配置密码。
 
-## 常用测试命令
+## 常用命令
 ```bash
 # 启动 Web UI
 streamlit run app.py
 
-# 单节点测试
-python test_node.py
-
-# parse_node 测试
-python test_parse.py
+# 临时测试脚本（用完即删，TIER_DEBUG patch 在脚本内完成）
+PYTHONIOENCODING=utf-8 python test_stream.py
 ```
 
 ## 目录说明
