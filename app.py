@@ -1122,12 +1122,17 @@ for msg in st.session_state.messages:
         _args_str = str(msg["tool_args"])
         if len(_args_str) > 80:
             _args_str = _args_str[:80] + "…"
+        _retries_r = msg.get("retries", 0)
+        _status_r  = (
+            f'<span class="tc-retry">⟳ 重试 {_retries_r}/3</span> <span class="tc-status">✓ 完成</span>'
+            if _retries_r else '<span class="tc-status">✓ 完成</span>'
+        )
         st.markdown(f"""
         <div class="tool-call-block">
             <span class="tc-step">STEP {msg["step"]}</span>
             <span class="{_tag_cls}">{msg["tool_name"]}</span>
             <span class="tc-args">{_args_str}</span>
-            <span class="tc-status">✓ 完成</span>
+            {_status_r}
         </div>
         """, unsafe_allow_html=True)
     elif role == "email_status":
@@ -1422,6 +1427,7 @@ if user_input:
                 "step":      i,
                 "tool_name": tc["tool_name"],
                 "tool_args": tc["tool_args"],
+                "retries":   _retries,
                 "content":   "",
             })
         if _steps_html_parts:

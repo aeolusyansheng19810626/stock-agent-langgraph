@@ -517,7 +517,7 @@ def _invoke_with_retry(fn, kwargs: dict, node: str, tool: str, max_retries: int 
     errors = []
     for attempt in range(max_retries):
         try:
-            return fn(**kwargs), errors
+            return fn(kwargs), errors
         except Exception as exc:
             if not _is_retryable_error(exc) or attempt == max_retries - 1:
                 errors.append({
@@ -921,12 +921,14 @@ def news_node(state: AgentState) -> dict:
         query = f"{query} {current_year}"
 
     errors = []
+    tool_calls = [{"tool_name": "search_web", "tool_args": {"query": query}}]
     raw_result, _errs = _invoke_with_retry(search_web.invoke, {"query": query}, "news_node", "search_web")
     errors.extend(_errs)
     if raw_result is None:
-        return {"news": "", "tool_calls": [], "errors": errors}
-
-    tool_calls = [{"tool_name": "search_web", "tool_args": {"query": query}}]
+        return {"news": "", "tool_calls": tool_calls, "errors": errors}
+    if isinstance(raw_result, str) and ("error" in raw_result.lower() or "invalid" in raw_result.lower() or "unauthorized" in raw_result.lower()):
+        errors.append({"node": "news_node", "tool": "search_web", "message": raw_result[:200], "retryable": False, "attempts": 1})
+        return {"news": "", "tool_calls": tool_calls, "errors": errors}
 
     # LLM post-reasoning: 对新闻原文做摘要与情绪分析
     analysis = f"[Web News]\n{raw_result}"  # 默认 fallback
@@ -974,6 +976,9 @@ def rag_node(state: AgentState) -> dict:
     raw_result, _errs = _invoke_with_retry(search_documents.invoke, {"query": query}, "rag_node", "search_documents")
     errors.extend(_errs)
     if raw_result is None:
+        return {"rag_result": "", "tool_calls": [], "errors": errors}
+    if isinstance(raw_result, str) and ("error" in raw_result.lower() or "invalid" in raw_result.lower()):
+        errors.append({"node": "rag_node", "tool": "search_documents", "message": raw_result[:200], "retryable": False, "attempts": 1})
         return {"rag_result": "", "tool_calls": [], "errors": errors}
 
     tool_calls = [{"tool_name": "search_documents", "tool_args": {"query": query}}]
