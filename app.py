@@ -746,6 +746,16 @@ section[data-testid="stSidebar"] {
     flex-shrink: 0;
 }
 
+.tc-retry {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #F59E0B !important;
+    background: rgba(245,158,11,0.12);
+    padding: 2px 8px;
+    border-radius: 20px;
+    flex-shrink: 0;
+}
+
 /* === 走势图卡片 === */
 .chart-card {
     background: var(--card);
@@ -1381,6 +1391,12 @@ if user_input:
                 "sent":    _email_sent,
             })
 
+        # 统计各工具的重试次数（retryable=True 表示中间失败后已重试）
+        _retry_counts: dict[str, int] = {}
+        for _err in _all_errors:
+            if isinstance(_err, dict) and _err.get("retryable"):
+                _retry_counts[_err.get("tool", "")] = _retry_counts.get(_err.get("tool", ""), 0) + 1
+
         # 显示各工具调用步骤（写入占位符，使其出现在 chat_message 上方，与 rerun 后顺序一致）
         _steps_html_parts = []
         for i, tc in enumerate((t for t in _all_tool_calls if "tool_name" in t), 1):
@@ -1390,11 +1406,16 @@ if user_input:
             _args_str  = str(tc["tool_args"])
             if len(_args_str) > 80:
                 _args_str = _args_str[:80] + "…"
+            _retries   = _retry_counts.get(tc["tool_name"], 0)
+            _status_html = (
+                f'<span class="tc-retry">⟳ 重试 {_retries}/3</span> <span class="tc-status">✓ 完成</span>'
+                if _retries else '<span class="tc-status">✓ 完成</span>'
+            )
             _steps_html_parts.append(f"""<div class="tool-call-block">
                 <span class="tc-step">STEP {i}</span>
                 <span class="{_tag_cls}">{tc['tool_name']}</span>
                 <span class="tc-args">{_args_str}</span>
-                <span class="tc-status">✓ 完成</span>
+                {_status_html}
             </div>""")
             st.session_state.messages.append({
                 "role":      "tool",

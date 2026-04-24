@@ -5,6 +5,7 @@ import logging
 import operator
 import os
 import re
+import time
 from datetime import datetime
 from typing import Annotated, List, Optional, TypedDict
 
@@ -497,6 +498,43 @@ def _invoke_with_cascade(messages: list, api_key: str, tiers: list, temperature:
     raise last_exc
 
 
+def _is_retryable_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "timeout", "timed out", "connection", "network", "reset by peer",
+        "ssl", "429", "rate limit", "too many requests",
+    ))
+
+
+def _invoke_with_retry(fn, kwargs: dict, node: str, tool: str, max_retries: int = 3):
+    """Call fn(**kwargs) with up to max_retries attempts and exponential backoff.
+
+    Returns (result, errors_list). On total failure result is None and errors_list
+    contains one final entry with retryable=False. Intermediate failures are appended
+    as retryable=True so the caller can surface them in the UI.
+    """
+    delays = [1, 2, 4]
+    errors = []
+    for attempt in range(max_retries):
+        try:
+            return fn(**kwargs), errors
+        except Exception as exc:
+            if not _is_retryable_error(exc) or attempt == max_retries - 1:
+                errors.append({
+                    "node": node, "tool": tool,
+                    "message": str(exc), "retryable": False,
+                    "attempts": attempt + 1,
+                })
+                return None, errors
+            errors.append({
+                "node": node, "tool": tool,
+                "message": str(exc), "retryable": True,
+                "attempt": attempt + 1,
+            })
+            time.sleep(delays[attempt])
+    return None, errors
+
+
 def _stream_with_cb(llm_obj, messages: list, cb) -> tuple[str, dict | None]:
     """Stream llm_obj token-by-token, calling cb(token) for each non-empty chunk. Returns (full_text, usage_or_None)."""
     full = ""
@@ -815,35 +853,23 @@ def data_node(state: AgentState) -> dict:
     errors = []
 
     for ticker in tickers:
-        try:
-            result = get_stock_data.invoke({"ticker": ticker})
+        result, _errs = _invoke_with_retry(get_stock_data.invoke, {"ticker": ticker}, "data_node", "get_stock_data")
+        errors.extend(_errs)
+        if result is not None:
             tool_calls.append({"tool_name": "get_stock_data", "tool_args": {"ticker": ticker}})
             raw_results.append(f"[Stock Data: {ticker}]\n{result}")
-        except Exception as exc:
-            errors.append({
-                "node": "data_node",
-                "tool": "get_stock_data",
-                "message": f"{ticker}: {exc}",
-                "retryable": True,
-            })
 
     if need_history:
         for index, ticker in enumerate(tickers):
             period = periods[index] if index < len(periods) else "6mo"
-            try:
-                result = get_stock_history.invoke({"ticker": ticker, "period": period})
+            result, _errs = _invoke_with_retry(get_stock_history.invoke, {"ticker": ticker, "period": period}, "data_node", "get_stock_history")
+            errors.extend(_errs)
+            if result is not None:
                 tool_calls.append({
                     "tool_name": "get_stock_history",
                     "tool_args": {"ticker": ticker, "period": period},
                 })
                 raw_results.append(f"[Price History: {ticker} / {period}]\n{result}")
-            except Exception as exc:
-                errors.append({
-                    "node": "data_node",
-                    "tool": "get_stock_history",
-                    "message": f"{ticker}/{period}: {exc}",
-                    "retryable": True,
-                })
 
     raw_text = "\n\n".join(raw_results)
 
@@ -895,19 +921,10 @@ def news_node(state: AgentState) -> dict:
         query = f"{query} {current_year}"
 
     errors = []
-    try:
-        raw_result = search_web.invoke({"query": query})
-    except Exception as exc:
-        return {
-            "news": "",
-            "tool_calls": [],
-            "errors": [{
-                "node": "news_node",
-                "tool": "search_web",
-                "message": str(exc),
-                "retryable": True,
-            }],
-        }
+    raw_result, _errs = _invoke_with_retry(search_web.invoke, {"query": query}, "news_node", "search_web")
+    errors.extend(_errs)
+    if raw_result is None:
+        return {"news": "", "tool_calls": [], "errors": errors}
 
     tool_calls = [{"tool_name": "search_web", "tool_args": {"query": query}}]
 
@@ -954,15 +971,10 @@ def rag_node(state: AgentState) -> dict:
 
     query = state["rag_query"]
     errors = []
-    try:
-        raw_result = search_documents.invoke({"query": query})
-    except Exception as exc:
-        err = {"node": "rag_node", "tool": "search_documents", "message": str(exc), "retryable": True}
-        return {
-            "rag_result": "",
-            "tool_calls": [],
-            "errors": [err],
-        }
+    raw_result, _errs = _invoke_with_retry(search_documents.invoke, {"query": query}, "rag_node", "search_documents")
+    errors.extend(_errs)
+    if raw_result is None:
+        return {"rag_result": "", "tool_calls": [], "errors": errors}
 
     tool_calls = [{"tool_name": "search_documents", "tool_args": {"query": query}}]
 
