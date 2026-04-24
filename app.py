@@ -106,11 +106,15 @@ def render_reflection(reflection_result: str):
 _PROCESSED_JSON = "./vectorstore/processed_files.json"
 
 def _load_processed_registry() -> dict:
-    """从磁盘读取已处理文件记录，跨会话持久化"""
+    """从磁盘读取已处理文件记录，跨会话持久化；自动过滤 tmp/ 中已不存在的文件"""
     if os.path.exists(_PROCESSED_JSON):
         import json as _json
         with open(_PROCESSED_JSON, "r", encoding="utf-8") as f:
-            return _json.load(f)
+            registry = _json.load(f)
+        valid = {k: v for k, v in registry.items() if os.path.exists(os.path.join("./tmp", k))}
+        if len(valid) != len(registry):
+            _save_processed_registry(valid)
+        return valid
     return {}
 
 def _save_processed_registry(registry: dict):
@@ -164,6 +168,11 @@ def process_uploaded_pdfs(files):
                 chunks = splitter.split_documents(docs)
                 for chunk in chunks:
                     chunk.metadata["source"] = file.name
+                if not chunks:
+                    st.warning(f"{file.name} 未提取到文本（可能是扫描件），已跳过向量化，仍可用于 financial_report_node 精读。")
+                    registry[file.name] = 0
+                    st.session_state.processed_docs = dict(registry)
+                    continue
                 if vectorstore is None:
                     vectorstore = Chroma.from_documents(
                         chunks, embeddings,
@@ -179,6 +188,34 @@ def process_uploaded_pdfs(files):
 
         _save_processed_registry(registry)
         invalidate_vectorstore()  # 让 search_documents 重新加载最新向量库
+
+def delete_uploaded_pdf(fname: str):
+    from langchain_community.vectorstores import Chroma
+    from tools import get_embeddings, VECTORSTORE_DIR, invalidate_vectorstore
+
+    # 删除 tmp/ 中的文件
+    tmp_path = os.path.join("./tmp", fname)
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    # 从 ChromaDB 中删除对应向量（按 source metadata 过滤）
+    if os.path.exists(VECTORSTORE_DIR) and any(os.scandir(VECTORSTORE_DIR)):
+        try:
+            vectorstore = Chroma(
+                persist_directory=VECTORSTORE_DIR,
+                embedding_function=get_embeddings(),
+                collection_name="stockai_docs",
+            )
+            vectorstore.delete(where={"source": fname})
+        except Exception:
+            pass
+        invalidate_vectorstore()
+
+    # 从 registry 中删除并同步 session_state
+    registry = _load_processed_registry()
+    registry.pop(fname, None)
+    _save_processed_registry(registry)
+    st.session_state.processed_docs = registry
 
 # ====== 页面配置 ======
 @st.cache_resource(show_spinner="正在加载 AI 引擎…")
@@ -935,12 +972,18 @@ with st.sidebar:
         st.session_state.processed_docs = _load_processed_registry()
 
     if st.session_state.processed_docs:
-        for fname, cnt in st.session_state.processed_docs.items():
-            st.markdown(
-                f'<div style="font-size:0.75rem;color:#6B7280;padding:2px 4px;">'
-                f'✅ {fname} <span style="color:#9CA3AF">({cnt} 片段)</span></div>',
-                unsafe_allow_html=True,
-            )
+        for fname, cnt in list(st.session_state.processed_docs.items()):
+            col_name, col_btn = st.columns([5, 1])
+            with col_name:
+                st.markdown(
+                    f'<div style="font-size:0.75rem;color:#6B7280;padding:4px 0;">'
+                    f'✅ {fname} <span style="color:#9CA3AF">({cnt} 片段)</span></div>',
+                    unsafe_allow_html=True,
+                )
+            with col_btn:
+                if st.button("🗑", key=f"del_{fname}", help=f"删除 {fname}"):
+                    delete_uploaded_pdf(fname)
+                    st.rerun()
     else:
         st.markdown(
             '<div style="font-size:0.75rem;color:#9CA3AF;padding:2px 4px;">暂无文档，上传后可查询财报数据</div>',
