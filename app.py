@@ -1176,19 +1176,6 @@ example_cards = [
     ("📰", "特斯拉最近有什么重要新闻和催化剂？",      "新闻资讯"),
     ("📧", "分析完英伟达后发报告到我的邮箱",          "邮件报告"),
 ]
-if not st.session_state.pending_input:
-    if st.session_state.messages:
-        st.markdown("<div style='margin-top:12px;margin-bottom:4px;color:#9CA3AF;font-size:13px;'>快捷提问</div>", unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    for i, (icon, question, tag) in enumerate(example_cards):
-        col = col1 if i % 2 == 0 else col2
-        with col:
-            st.markdown('<div class="example-card-btn">', unsafe_allow_html=True)
-            if st.button(f"{icon}  {question}\n\n🏷 {tag}", key=f"example_card_{i}", use_container_width=True):
-                st.session_state.pending_input = question
-                st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
-
 # ====== 处理用户输入（卡片点击 或 手动输入） ======
 user_input = None
 
@@ -1464,9 +1451,21 @@ if user_input:
                 "caption": caption,
             })
 
-        st.rerun()  # 刷新页面：清除"AI正在分析中"，显示正常聊天界面
-
     except Exception as e:
         st.error(f"❌ 处理出错：{e}")
         import traceback
         st.code(traceback.format_exc(), language="text")
+
+# ====== 预设卡片（始终渲染在最新内容之后） ======
+if not st.session_state.pending_input:
+    if st.session_state.messages:
+        st.markdown("<div style='margin-top:12px;margin-bottom:4px;color:#9CA3AF;font-size:13px;'>快捷提问</div>", unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    for i, (icon, question, tag) in enumerate(example_cards):
+        col = col1 if i % 2 == 0 else col2
+        with col:
+            st.markdown('<div class="example-card-btn">', unsafe_allow_html=True)
+            if st.button(f"{icon}  {question}\n\n🏷 {tag}", key=f"example_card_{i}", use_container_width=True):
+                st.session_state.pending_input = question
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
