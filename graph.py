@@ -703,7 +703,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
     if "news" in agents and not news_query:
         news_query = user_input
 
-    rag_query = str(rag_params.get("query", "")).strip()
+    rag_query = str(rag_params.get("query") or "").strip()
     if "rag" in agents:
         if not rag_available:
             agents.remove("rag")
@@ -812,8 +812,8 @@ def parse_node(state: AgentState) -> dict:
         "need_rag": "rag" in agents and bool(rag_params.get("query")),
         "need_history": bool(data_params.get("need_history", False)),
         "periods": data_params.get("periods", []),
-        "news_query": news_params.get("query", ""),
-        "rag_query": rag_params.get("query", ""),
+        "news_query": str(news_params.get("query") or ""),
+        "rag_query": str(rag_params.get("query") or ""),
         "email_params": plan.get("email_params"),
         "need_scoring": bool(plan.get("need_scoring", False)),
         "need_risk": bool(plan.get("need_risk", False)),
@@ -915,7 +915,7 @@ def news_node(state: AgentState) -> dict:
     if not state.get("need_news"):
         return {"news": "", "tool_calls": [], "errors": []}
 
-    query = state["news_query"]
+    query = str(state["news_query"])
     current_year = str(datetime.now().year)
     if current_year not in query:
         query = f"{query} {current_year}"
@@ -971,7 +971,7 @@ def rag_node(state: AgentState) -> dict:
     if not state.get("need_rag"):
         return {"rag_result": "", "tool_calls": [], "errors": []}
 
-    query = state["rag_query"]
+    query = str(state["rag_query"])
     errors = []
     raw_result, _errs = _invoke_with_retry(search_documents.invoke, {"query": query}, "rag_node", "search_documents")
     errors.extend(_errs)
