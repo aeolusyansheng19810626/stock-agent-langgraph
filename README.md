@@ -67,7 +67,8 @@ parse_node（QUALITY_CASCADE）
    ↓ 条件路由（并行）
    ├─ [条件] data_node    → yfinance 获取数据   → LLaMA 技术面分析
    ├─ [条件] news_node    → Tavily 搜索新闻    → LLaMA 新闻摘要+情绪判断
-   └─ [条件] rag_node     → ChromaDB 检索财报  → QUALITY_CASCADE 财务指标提取
+   ├─ [条件] rag_node     → ChromaDB 检索财报  → QUALITY_CASCADE 财务指标提取
+   └─ [条件] image_analysis → Gemini 2.5 Flash 原生读取上传图片（如有）
    ↓ fan-in（并行分析节点）
 [条件] deep_read_node     → need_deep_read=true，双阶段精读批判
 [条件] scoring_node       → need_scoring=true，Chain-of-Thought 多维度评分
@@ -77,7 +78,8 @@ parse_node（QUALITY_CASCADE）
 [条件] reflection_node    → need_reflection=true，报告审核与修订建议
    ↓
 report_node
-  ├─ 运行模式：Gemini 2.5 Flash → 失败 fallback Groq QUALITY_CASCADE
+  ├─ 运行模式：Gemini 2.5 Flash（原生支持多模态图文）
+  ├─ 兜底机制：Gemini 失败或不支持图片时，自动 Fallback 至 Groq 纯文字分析（QUALITY_CASCADE）
   ├─ 开发模式：Groq QUALITY_CASCADE
   ├─ 逐 token 流式输出（_report_streaming_cb 注入）
   └─ 追加 comparison / risk_matrix / hypothesis / deep_read 结构化段落
@@ -85,6 +87,16 @@ report_node
 
 每个中间节点都是真正的 Agent：先调用工具拿到原始数据，再用 LLM 做领域分析，
 `report_node` 接收的是各 Agent 的预分析结论，而不是裸数据。
+
+---
+
+## 多模态支持 (Image Analysis)
+
+系统现在支持 **JPG/PNG/WEBP** 格式图片的上传与分析：
+- **上传方式**：Streamlit 聊天输入框内嵌的 `+` 号按钮（利用 `st.chat_input(accept_file=True)`）。
+- **处理流程**：图片在前端自动压缩（512x512）并转为 Base64，存入 `AgentState["image_data"]`。
+- **智能调度**：`parse_node` 识别到图片后，会自动在提示词中注入视觉分析指令，并引导 `report_node` 开启多模态链路。
+- **模型限制**：有图片时，`report_node` 会自动跳过不支持视觉的 Llama 模型，优先尝试顶级视觉模型层级。
 
 ---
 
@@ -102,7 +114,8 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
 | 节点 | 模型策略 |
 |------|----------|
-| parse / rag / scoring / report(Groq) / financial_report Reduce | QUALITY_CASCADE |
+| parse / rag / scoring / report(Groq-Text) / financial_report Reduce | QUALITY_CASCADE |
+| report_node (Vision) | [TOP, UPPER_MID, MID] (跳过 Llama) |
 | risk / comparison / reflection | [TOP, UPPER_MID, MID] |
 | hypothesis | [TOP, UPPER_MID, MID, LOW] |
 | deep_read S1 | [MID, LOW, DEBUG] |

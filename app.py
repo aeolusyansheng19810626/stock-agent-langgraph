@@ -80,6 +80,27 @@ def extract_text(content) -> str:
     return str(content)
 
 
+def process_uploaded_image(uploaded_file) -> str:
+    """将上传的图片转换为base64，限制尺寸以控制token消耗"""
+    try:
+        from PIL import Image
+        import base64
+        from io import BytesIO
+        
+        img = Image.open(uploaded_file)
+        # 限制最大尺寸为512×512像素
+        img.thumbnail((512, 512))
+        
+        # 转换为PNG格式（保证透明度）
+        buffered = BytesIO()
+        img.save(buffered, format="PNG", optimize=True)
+        
+        return base64.b64encode(buffered.getvalue()).decode()
+    except Exception as e:
+        st.error(f"图片处理失败: {e}")
+        return None
+
+
 def render_reflection(reflection_result: str):
     if not reflection_result:
         return
@@ -867,6 +888,15 @@ hr { border: none; border-top: 1px solid var(--border) !important; margin: 12px 
     transform: translateY(0) !important;
     box-shadow: var(--shadow-sm) !important;
 }
+
+/* 输入框上方提示（accept_file 附件按钮说明） */
+[data-testid="stBottom"]::before {
+    content: '📷  点击左侧 + 可附加图片（JPG / PNG / WEBP，2MB 以内）';
+    display: block;
+    font-size: 0.72rem;
+    color: #9CA3AF;
+    padding: 4px 14px 2px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -887,6 +917,8 @@ if "page" not in st.session_state:
     st.session_state.page = "chat"
 if "history_clear_confirm" not in st.session_state:
     st.session_state.history_clear_confirm = False
+if "uploaded_image" not in st.session_state:
+    st.session_state.uploaded_image = None
 
 # ====== 侧边栏 ======
 with st.sidebar:
@@ -1183,11 +1215,32 @@ user_input = None
 if st.session_state.pending_input:
     user_input = st.session_state.pending_input
     st.session_state.pending_input = None
+    # 点击卡片时默认不带图，清除历史残留
+    st.session_state.uploaded_image = None
 
-# 手动输入（始终渲染输入框）
-typed = st.chat_input("请输入你的问题，例如：分析一下英伟达的股票...")
-if typed:
-    user_input = typed
+# 手动输入 —— accept_file 将图片按鈕内嵌在输入框内（Streamlit 1.40+）
+_chat_result = st.chat_input(
+    "请输入你的问题，例如：分析一下英伟达的股票...",
+    accept_file=True,
+    file_type=["jpg", "jpeg", "png", "webp"],
+)
+if _chat_result:
+    user_input = _chat_result.text or ""
+    # 处理随消息附带的图片
+    if _chat_result.files:
+        _uf = _chat_result.files[0]
+        if _uf.size <= 2 * 1024 * 1024:
+            _b64 = process_uploaded_image(_uf)
+            if _b64:
+                st.session_state.uploaded_image = _b64
+        else:
+            st.warning("图片大小超过2MB，已自动忽略")
+    else:
+        # 本条消息未附图，清除上一条的图片（避免误用）
+        st.session_state.uploaded_image = None
+    # 仅发图片时给一个默认提示词
+    if not user_input and st.session_state.uploaded_image:
+        user_input = "请分析这张图片"
 
 if user_input:
     with st.chat_message("user"):
@@ -1245,6 +1298,7 @@ if user_input:
             "gemini_exhausted":     _gem_ex_snap,
             "rag_available":        bool(_load_processed_registry()),
             "pdf_path":             os.path.join("./tmp", list(st.session_state.processed_docs.keys())[0]) if st.session_state.processed_docs else None,
+            "image_data":           st.session_state.get("uploaded_image"),
             "use_financial_report": bool(st.session_state.processed_docs),
             "tool_calls":           [],
             "errors":               [],
@@ -1455,6 +1509,8 @@ if user_input:
         st.error(f"❌ 处理出错：{e}")
         import traceback
         st.code(traceback.format_exc(), language="text")
+
+
 
 # ====== 预设卡片（始终渲染在最新内容之后） ======
 if not st.session_state.pending_input:

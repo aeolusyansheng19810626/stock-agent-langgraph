@@ -46,6 +46,7 @@ class AgentState(TypedDict):
     need_reflection: bool
     comparison_dimensions: List[str]
     pdf_path: Optional[str]
+    image_data: Optional[str]
     use_financial_report: bool
     financial_metrics: Optional[dict]
     risk_signals: Optional[list]
@@ -87,6 +88,9 @@ TIER_DEBUG     = "llama-3.1-8b-instant"
 # Quality 节点从上到下依次降级；Fast 节点直接用 TIER_LOW，不降级
 QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
+def get_visual_cascade():
+    """有图片时使用的模型层级（跳过两个llama）"""
+    return [TIER_TOP, TIER_UPPER_MID, TIER_MID]
 
 RATE_LIMIT_KEYWORDS = ("429", "rate_limit", "rate limit", "503", "over_capacity", "model_overloaded")
 
@@ -674,9 +678,9 @@ def _infer_plan_from_text(state: dict, rag_available: bool) -> dict:
     }
 
 
-def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
+def _normalize_plan(plan: dict, user_input: str, rag_available: bool, image_data: Optional[str] = None) -> dict:
     if not isinstance(plan, dict):
-        return _infer_plan_from_text(user_input, rag_available)
+        return _infer_plan_from_text({"user_input": user_input, "use_financial_report": False, "pdf_path": None}, rag_available)
 
     allowed_agents = {"data", "news", "rag", "email"}
     agents = [agent for agent in plan.get("agents", []) if agent in allowed_agents]
@@ -754,7 +758,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
             rag_query = user_input
 
     if not agents:
-        return _infer_plan_from_text(user_input, rag_available)
+        return _infer_plan_from_text({"user_input": user_input, "use_financial_report": use_financial_report, "pdf_path": plan.get("pdf_path")}, rag_available)
 
     return {
         "agents": agents,
@@ -774,6 +778,7 @@ def _normalize_plan(plan: dict, user_input: str, rag_available: bool) -> dict:
         "comparison_dimensions": comparison_dimensions,
         "need_reflection": need_reflection,
         "use_financial_report": use_financial_report,
+        "image_data": image_data,
     }
 
 
@@ -782,13 +787,15 @@ def parse_node(state: AgentState) -> dict:
     history_ctx = state.get("chat_history_text", "")
     planner_error = None
     rag_available = bool(state.get("rag_available", False))
+    image_data = state.get("image_data")
 
     model_used = QUALITY_CASCADE[0]
 
     history_prefix = f"History:\n{history_ctx}\n" if history_ctx else ""
+    image_note = "\n[用户上传了图片，请考虑视觉输入进行分析。]" if image_data else ""
     plan_messages = [
         SystemMessage(content=PLAN_SYSTEM),
-        HumanMessage(content=f"{history_prefix}User query: {state['user_input']}"),
+        HumanMessage(content=f"{history_prefix}User query: {state['user_input']}{image_note}"),
     ]
 
     _parse_usage = None
@@ -799,7 +806,7 @@ def parse_node(state: AgentState) -> dict:
         planner_error = str(exc)
         raw_plan = _infer_plan_from_text(state, rag_available)
 
-    plan = _normalize_plan(raw_plan, state["user_input"], rag_available)
+    plan = _normalize_plan(raw_plan, state["user_input"], rag_available, image_data)
     agents = plan.get("agents", [])
     data_params = plan.get("data_params") or {}
     news_params = plan.get("news_params") or {}
@@ -824,6 +831,7 @@ def parse_node(state: AgentState) -> dict:
         "need_reflection": bool(plan.get("need_reflection", False)),
         "use_financial_report": state.get("use_financial_report", False) or bool(plan.get("use_financial_report", False)),
         "pdf_path": state.get("pdf_path") or plan.get("pdf_path") or _extract_pdf_path(state["user_input"]),
+        "image_data": image_data,
         "tool_calls": [{"tool_name": "llm", "tool_args": {"node": "parse", "model": model_used}}]
             + ([{"node": "parse", "token_usage": _parse_usage}] if _parse_usage else []),
         "errors": [],
@@ -1536,27 +1544,98 @@ def report_node(state: AgentState) -> dict:
         f"Tool failures:\n{error_section}\n\n"
         "Write the final answer using only the available information."
     )
-    messages = [SystemMessage(content=REPORT_SYSTEM), HumanMessage(content=prompt)]
+    # 有图片时构建多模态消息（image_url content block），图文一起发给模型
+    # process_uploaded_image() 统一转为 PNG，故 MIME type 固定 image/png
+    _image_data = state.get("image_data")
+    if _image_data:
+        messages = [
+            SystemMessage(content=REPORT_SYSTEM),
+            HumanMessage(content=[
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_image_data}"}},
+            ]),
+        ]
+    else:
+        messages = [SystemMessage(content=REPORT_SYSTEM), HumanMessage(content=prompt)]
 
     _report_usage = None
 
+    # 纯文字版消息（多模态失败时降级用）
+    _text_only_messages = [SystemMessage(content=REPORT_SYSTEM), HumanMessage(content=prompt)]
+
+    # 图片多模态降级提示（流式推送 + 写入 final_report）
+    _IMAGE_FALLBACK_NOTICE = "\n\n> ⚠️ **注意：当前模型不支持图片读取，已自动切换为文字分析。**\n\n"
+
+    # 明确本地引用，防止闭包作用域异常
+    _QC = QUALITY_CASCADE
+    _V_CASCADE = get_visual_cascade()
+
+    def _text_fallback(cb) -> tuple[str, str, dict | None]:
+        """降级纯文字全级联，向 cb 推送提示并执行文字分析"""
+        if cb:
+            cb(_IMAGE_FALLBACK_NOTICE)
+        try:
+            # 降级后尝试完整 QUALITY_CASCADE
+            _ft, _fm, _fu = _invoke_with_cascade(_text_only_messages, groq_api_key, _QC)
+            if not _ft or not _ft.strip():
+                _ft = "⚠️ 切换为文字分析后，模型未返回有效内容。"
+            elif cb:
+                cb(_ft) # 推送全文到 UI
+            return _IMAGE_FALLBACK_NOTICE + _ft, _fm, _fu
+        except Exception as _e:
+            import traceback
+            logger.error(f"Fallback failed: {traceback.format_exc()}")
+            _err_msg = f"⚠️ 切换为文字分析时出错：{_e}"
+            if cb:
+                cb(_err_msg)
+            return _IMAGE_FALLBACK_NOTICE + _err_msg, "error", None
+
     def call_groq() -> tuple[str, str, dict | None]:
+        _has_image = bool(state.get("image_data") and isinstance(state.get("image_data"), str) and len(state.get("image_data")) > 100)
         _cb = _report_streaming_cb
+        # 有图片时先用视觉级联；如多模态不支持则自动降级为纯文字 + 全级联
+        cascade = get_visual_cascade() if _has_image else _QC
+        _msgs = messages  # 默认用多模态消息（有图时）
+        
         if _cb:
             _last_exc: Exception = Exception("no tiers provided")
-            for _m in QUALITY_CASCADE:
+            for _m in cascade:
                 try:
                     _llm = ChatGroq(api_key=groq_api_key, model=_m, temperature=0.1)
-                    _txt, _usg = _stream_with_cb(_llm, messages, _cb)
-                    return _txt, _m, _usg
+                    _txt, _usg = _stream_with_cb(_llm, _msgs, _cb)
+                    if _txt and _txt.strip():
+                        return _txt, _m, _usg
                 except Exception as _exc:
-                    if any(k in str(_exc).lower() for k in RATE_LIMIT_KEYWORDS):
+                    # 如果是多模态不支持的错误（通常是 400 Bad Request），则降级
+                    _err_str = str(_exc).lower()
+                    if any(k in _err_str for k in RATE_LIMIT_KEYWORDS):
                         _last_exc = _exc
                         continue
+                    
+                    if _has_image:
+                        logger.warning("Multimodal rejected by %s, falling back to text-only: %s", _m, _exc)
+                        return _text_fallback(_cb)
                     raise
+            
+            # 如果视觉级联跑完都没结果且有图，最后尝试降级
+            if _has_image:
+                logger.warning("Visual cascade finished without success, falling back to text-only")
+                return _text_fallback(_cb)
             raise _last_exc
-        text, model, usage = _invoke_with_cascade(messages, groq_api_key, QUALITY_CASCADE)
-        return text, model, usage
+            
+        # 非流式路径
+        try:
+            text, model, usage = _invoke_with_cascade(_msgs, groq_api_key, cascade)
+            if not text.strip() and _has_image:
+                return _text_fallback(None)
+            return text, model, usage
+        except Exception as _exc:
+            if _has_image and not any(k in str(_exc).lower() for k in RATE_LIMIT_KEYWORDS):
+                return _text_fallback(None)
+            raise
+
+
+
 
     if dev_mode or gemini_exhausted:
         try:
@@ -1581,12 +1660,15 @@ def report_node(state: AgentState) -> dict:
             temperature=0.1,
         )
 
+        # 根据是否有图，选择发给 Gemini 的消息格式
+        _gem_msgs = messages if state.get("image_data") else _text_only_messages
+
         _cb_gem = _report_streaming_cb
         try:
             if _cb_gem:
-                text, _gem_usage = _stream_with_cb(gemini_llm, messages, _cb_gem)
+                text, _gem_usage = _stream_with_cb(gemini_llm, _gem_msgs, _cb_gem)
             else:
-                resp = gemini_llm.invoke(messages)
+                resp = gemini_llm.invoke(_gem_msgs)
                 text = _extract_text(resp.content)
                 _um = getattr(resp, "usage_metadata", None)
                 _gem_usage = {
@@ -1594,20 +1676,22 @@ def report_node(state: AgentState) -> dict:
                     "completion_tokens": _um.get("output_tokens", 0),
                     "total_tokens":      _um.get("total_tokens", 0),
                 } if _um else None
-            if text.strip():
+            if text and text.strip():
                 response = text
-                final_model = "Gemini"
+                final_model = "Gemini-2.5-Flash"
                 _report_usage = _gem_usage
             else:
+
+                logger.warning("Gemini returned empty or whitespace-only text.")
                 response, final_model, _report_usage = call_groq()
+
         except Exception as exc:
             err = str(exc)
-            # 以下情况 fallback 到 Groq：配额耗尽、限速、服务不可用
-            if any(k in err for k in ("RESOURCE_EXHAUSTED", "UNAVAILABLE") + RATE_LIMIT_KEYWORDS):
-                response, final_model, _report_usage = call_groq()
-                new_gemini_exhausted = "RESOURCE_EXHAUSTED" in err
-            else:
-                raise
+            logger.warning(f"Gemini failed ({_gem_msgs[0].content if _gem_msgs else 'no msgs'}), falling back to Groq: {err}")
+            new_gemini_exhausted = any(k in err for k in ("RESOURCE_EXHAUSTED", "429"))
+            response, final_model, _report_usage = call_groq()
+
+
 
         if response is None:
             response, final_model, _report_usage = call_groq()

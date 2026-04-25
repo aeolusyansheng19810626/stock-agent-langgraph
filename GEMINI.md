@@ -43,7 +43,7 @@ START → parse_node
 need_data / need_news / need_rag / need_scoring
 need_risk / need_comparison / need_hypothesis
 need_reflection / need_deep_read
-use_financial_report / pdf_path
+use_financial_report / pdf_path / image_data
 
 # 数据流
 stock_data / news / rag_result
