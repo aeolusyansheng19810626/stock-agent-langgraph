@@ -16,3 +16,6 @@ web/dist/
 web/.vite/
 design_handoff_stockai/
 /main.py
+*.png
+*.jpg
+*.jpeg
