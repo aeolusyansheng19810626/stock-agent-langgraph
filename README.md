@@ -41,7 +41,11 @@ python -m uvicorn server.main:app --host 0.0.0.0 --port 8000
 ```bash
 docker build -t stockai .
 docker run -p 7860:7860 \
-  -e GROQ_API_KEY=xxx -e GEMINI_API_KEY=yyy -e TAVILY_API_KEY=zzz \
+  -e GROQ_API_KEY=xxx \
+  -e TAVILY_API_KEY=zzz \
+  -e GCP_SA_KEY="$(base64 -w0 /path/to/sa-key.json)" \
+  -e GOOGLE_CLOUD_PROJECT=your-project \
+  -e GOOGLE_CLOUD_REGION=us-central1 \
   stockai
 ```
 
@@ -101,13 +105,20 @@ stock-agent-langgraph/
 
 ---
 
-## API Keys
+## API Keys / 环境变量
 
 ```
-GROQ_API_KEY=your_groq_api_key
-GEMINI_API_KEY=your_gemini_api_key
-TAVILY_API_KEY=your_tavily_api_key
+GROQ_API_KEY=          # Groq API key（Gemini 失败时 fallback）
+TAVILY_API_KEY=        # Tavily 新闻搜索
+GOOGLE_CLOUD_PROJECT=  # GCP 项目 ID（默认 yansheng-project）
+GOOGLE_CLOUD_REGION=   # Vertex AI 区域（默认 us-central1）
 ```
+
+**GCP 认证**：本地开发使用 `gcloud auth application-default login`（ADC）；
+生产/Docker 用 Service Account JSON，base64 编码后设为环境变量 `GCP_SA_KEY`，
+容器启动时由 `entrypoint.sh` 自动 decode 并注入 `GOOGLE_APPLICATION_CREDENTIALS`。
+
+> `GEMINI_API_KEY` 已废弃（原 Google AI Studio 接入），现已切换至 Vertex AI。
 
 ---
 
@@ -121,10 +132,10 @@ parse_node（QUALITY_CASCADE）
    ↓ 条件路由
    ├─ [条件] financial_report_node → pdfplumber Map + QUALITY_CASCADE Reduce
    ↓ 条件路由（并行）
-   ├─ [条件] data_node    → yfinance 获取数据   → LLaMA 技术面分析
-   ├─ [条件] news_node    → Tavily 搜索新闻    → LLaMA 新闻摘要+情绪判断
-   ├─ [条件] rag_node     → ChromaDB 检索财报  → QUALITY_CASCADE 财务指标提取
-   └─ [条件] image_analysis → Gemini 2.5 Flash 原生读取上传图片（如有）
+   ├─ [条件] data_node    → yfinance 获取数据   → Gemini Flash 技术面分析
+   ├─ [条件] news_node    → Tavily 搜索新闻    → Gemini Flash 新闻摘要+情绪判断
+   ├─ [条件] rag_node     → ChromaDB 检索财报  → Gemini Flash 财务指标提取
+   └─ [条件] image_analysis → Gemini 2.5 Pro 原生读取上传图片（如有）
    ↓ fan-in（并行分析节点）
 [条件] deep_read_node     → need_deep_read=true，双阶段精读批判
 [条件] scoring_node       → need_scoring=true，Chain-of-Thought 多维度评分
@@ -134,8 +145,8 @@ parse_node（QUALITY_CASCADE）
 [条件] reflection_node    → need_reflection=true，报告审核与修订建议
    ↓
 report_node
-  ├─ 运行模式：Gemini 2.5 Flash（原生支持多模态图文）
-  ├─ 兜底机制：Gemini 失败或不支持图片时，自动 Fallback 至 Groq 纯文字分析（QUALITY_CASCADE）
+  ├─ 运行模式：Gemini 2.5 Pro（Vertex AI，原生支持多模态图文）
+  ├─ 兜底机制：Gemini 失败时自动 Fallback 至 Groq（含图片多模态降级）
   ├─ 开发模式：Groq QUALITY_CASCADE
   ├─ 逐 token 流式输出（_report_streaming_cb 注入）
   └─ 追加 comparison / risk_matrix / hypothesis / deep_read 结构化段落
@@ -156,28 +167,32 @@ report_node
 
 ---
 
-## 模型配置（5-tier）
+## 模型配置
+
+### 主力：Vertex AI Gemini（所有节点首选）
+
+```python
+GEMINI_FLASH = "google/gemini-2.5-flash"  # 速度优先节点
+GEMINI_PRO   = "google/gemini-2.5-pro"    # 质量优先节点
+```
+
+| 节点 | 主力模型 | Groq Fallback |
+|------|----------|---------------|
+| data_node / news_node / rag_node / scoring_node / deep_read S1 | Gemini **Flash** | TIER_LOW / QUALITY_CASCADE |
+| parse_node / risk_node / comparison_node / hypothesis_node / deep_read S2 / reflection_node | Gemini **Pro** | QUALITY_CASCADE / 专属 CASCADE |
+| report_node | Gemini **Pro**（流式，支持多模态） | call_groq()（含图片降级） |
+
+### Fallback：Groq（Gemini 异常时自动切换）
 
 ```python
 TIER_TOP       = "openai/gpt-oss-120b"
 TIER_UPPER_MID = "openai/gpt-oss-20b"
 TIER_MID       = "qwen/qwen3-32b"
-TIER_LOW       = "meta-llama/llama-4-scout-17b-16e-instruct"  # Fast 节点固定
-TIER_DEBUG     = "llama-3.1-8b-instant"                       # 调试专用
+TIER_LOW       = "meta-llama/llama-4-scout-17b-16e-instruct"
+TIER_DEBUG     = "llama-3.1-8b-instant"  # 调试专用
 
 QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 ```
-
-| 节点 | 模型策略 |
-|------|----------|
-| parse / rag / scoring / report(Groq-Text) / financial_report Reduce | QUALITY_CASCADE |
-| report_node (Vision) | [TOP, UPPER_MID, MID] (跳过 Llama) |
-| risk / comparison / reflection | [TOP, UPPER_MID, MID] |
-| hypothesis | [TOP, UPPER_MID, MID, LOW] |
-| deep_read S1 | [MID, LOW, DEBUG] |
-| deep_read S2 | [TOP, UPPER_MID, MID] |
-| data / news / financial_report Map | TIER_LOW 固定 |
-| report_node | Gemini 2.5 Flash → Groq fallback |
 
 ---
 
@@ -221,14 +236,9 @@ fetch /api/analyze (POST + body)  →   set_streaming_cb(emit)         →    _r
 
 ## Gemini 配额
 
-| 限制 | 额度 |
-|------|------|
-| RPM | 5 |
-| RPD | 20 |
-| 重置时间 | 北京时间 15:00 |
-
-- `RESOURCE_EXHAUSTED` → SSE `done.gemini_exhausted=true`，前端 settings store 自动置位，后续请求带 `gemini_exhausted: true` 直接走 Groq
-- 设置抽屉里关掉「开发模式」开关 + 刷新页面即可重置
+现已切换至 **Vertex AI**，按 token 计费，无 RPM/RPD 免费额度限制。
+如遇 `RESOURCE_EXHAUSTED`（项目配额耗尽）→ SSE `done.gemini_exhausted=true`，
+前端自动切换后续请求走 Groq，设置抽屉关掉「开发模式」+ 刷新页面可重置。
 
 ---
 
@@ -282,20 +292,24 @@ fetch /api/analyze (POST + body)  →   set_streaming_cb(emit)         →    _r
 
 ## 部署到 HuggingFace Spaces
 
-1. 在 HF 创建一个 **Docker** 类型的 Space（Spaces 的 Streamlit / Gradio 模板都不适用）
-2. 把本仓库 push 到该 Space 的 git 远端（`git remote add space https://huggingface.co/spaces/<user>/<name>`）
-3. Space Settings → Variables and secrets 里配置：
-   - `GROQ_API_KEY`、`GEMINI_API_KEY`、`TAVILY_API_KEY`
-4. Space 自动用根目录 `Dockerfile` 构建（多阶段：node:20 build web/ → python:3.11-slim runtime）
-5. 默认监听 7860，HF Space 自动反代到公网
+本项目通过 **GitHub Actions 自动同步**到 HF Space（`.github/workflows/sync-to-hf.yml`），
+每次 push master 分支自动触发 Docker build。
+
+**前置步骤**：
+1. HF 创建 **Docker（Blank）** 类型 Space
+2. GitHub repo → Settings → Secrets 添加 `HF_TOKEN`（HF write token）
+3. HF Space → Settings → Repository secrets 添加：
+
+| Secret | 说明 |
+|--------|------|
+| `GROQ_API_KEY` | Groq API key |
+| `TAVILY_API_KEY` | Tavily 新闻搜索 |
+| `GCP_SA_KEY` | GCP Service Account JSON 的 base64 编码（`base64 -w0 key.json`） |
+| `GOOGLE_CLOUD_PROJECT` | GCP 项目 ID |
+| `GOOGLE_CLOUD_REGION` | Vertex AI 区域（如 `us-central1`） |
+
+push master 后 GitHub Actions 将代码同步到 HF，HF 自动 Docker build，监听 7860 端口。
 
 **已知约束**：
-- HF Free Tier 容器是 **ephemeral** 的：`tmp/`、`vectorstore/`、`charts/` 重启后丢失。需要持久化要开启 HF Persistent Storage（付费）
-- Gmail 邮件发送依赖 `token.pickle`，HF Space 跑不了 OAuth 交互流程；需要本地完成首次授权后把 token 一起 push（注意它是认证凭证，不要 push 到公开 Space）
-
-**本地 Docker 验证**：
-```bash
-docker build -t stockai .
-docker run -p 7860:7860 -e GROQ_API_KEY=xxx -e GEMINI_API_KEY=yyy -e TAVILY_API_KEY=zzz stockai
-# 浏览器打开 http://localhost:7860
-```
+- HF Free Tier 容器是 **ephemeral** 的：`tmp/`、`vectorstore/`、`charts/` 重启后丢失
+- Gmail 邮件发送依赖 `token.pickle`，需本地完成首次 OAuth 授权后随代码一并提交（私有 Space）
