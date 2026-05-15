@@ -10,7 +10,7 @@ export const UserMessage: React.FC<{ msg: UserMsg }> = ({ msg }) => (
   <div className="sx-msg user">
     <div className="sx-msg-head">
       <span className="sx-mono">{nowTime()}</span>
-      <span className="sx-role">陈先生</span>
+      <span className="sx-role">我</span>
     </div>
     <div className="sx-msg-body">
       {msg.imageB64 && (

@@ -1,30 +1,65 @@
 import React from "react";
 
-/* Static index/macro list — yfinance can serve some of these (^SSEC ^HSI etc),
- * but for visual correctness we keep the design-fixture values until M10
- * wires real-time poll. North-bound flow has no free data source.
- *  TODO: 接入北向资金数据源 */
-const ITEMS: { sym: string; price: string; chg: string; dir: "up" | "down" }[] = [
-  { sym: "上证指数",     price: "3,284.62",  chg: "+0.62%",   dir: "up"   },
-  { sym: "深证成指",     price: "10,418.30", chg: "+0.94%",   dir: "up"   },
-  { sym: "创业板指",     price: "2,106.78",  chg: "+1.34%",   dir: "up"   },
-  { sym: "恒生指数",     price: "19,842.18", chg: "-0.54%",   dir: "down" },
-  { sym: "科创50",       price: "942.18",    chg: "+1.82%",   dir: "up"   },
-  { sym: "美元/人民币",  price: "7.214",     chg: "-0.08%",   dir: "down" },
-  { sym: "北向资金",     price: "+38.4亿",   chg: "净流入",   dir: "up"   },
-  { sym: "COMEX金",      price: "2,712.30",  chg: "+0.18%",   dir: "up"   },
-  { sym: "布伦特原油",   price: "71.26",     chg: "-0.84%",   dir: "down" },
-  { sym: "10年期国债",   price: "2.118%",    chg: "-1bp",     dir: "down" },
-];
+const SYMBOLS = "000001.SS,399001.SZ,399006.SZ,^HSI,CNY=X,GC=F,BZ=F";
+
+const LABELS: Record<string, string> = {
+  "000001.SS": "上证指数",
+  "399001.SZ": "深证成指",
+  "399006.SZ": "创业板指",
+  "^HSI":      "恒生指数",
+  "CNY=X":     "美元/人民币",
+  "GC=F":      "COMEX金",
+  "BZ=F":      "布伦特原油",
+};
+
+interface TickerItem {
+  sym: string;
+  price: string;
+  chg: string;
+  dir: "up" | "down" | "flat";
+}
+
+function fmt(symbol: string, price: number): string {
+  if (symbol === "CNY=X") return price.toFixed(4);
+  if (price >= 1000) return price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return price.toFixed(2);
+}
+
+async function fetchTicker(): Promise<TickerItem[]> {
+  const res = await fetch(`/api/quote?symbols=${SYMBOLS}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  const quotes: any[] = data.quotes ?? [];
+  return quotes
+    .filter((q) => q.price != null)
+    .map((q) => {
+      const pct: number = q.pct ?? 0;
+      return {
+        sym:   LABELS[q.symbol] ?? q.symbol,
+        price: fmt(q.symbol, q.price),
+        chg:   (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%",
+        dir:   pct > 0 ? "up" : pct < 0 ? "down" : "flat",
+      };
+    });
+}
 
 export const Ticker: React.FC = () => {
-  // Duplicate the array to make translateX(-50%) loop seamless.
-  const doubled = [...ITEMS, ...ITEMS];
+  const [items, setItems] = React.useState<TickerItem[]>([]);
+
+  React.useEffect(() => {
+    fetchTicker().then(setItems);
+    const id = setInterval(() => fetchTicker().then(setItems), 90_000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (items.length === 0) return <div className="sx-ticker" />;
+
+  const doubled = [...items, ...items];
   return (
     <div className="sx-ticker">
       <div className="sx-ticker-label">
         <span className="sx-pulse" />
-        实时 · A 股盘中
+        实时行情
       </div>
       <div className="sx-ticker-track">
         {doubled.map((it, i) => (
