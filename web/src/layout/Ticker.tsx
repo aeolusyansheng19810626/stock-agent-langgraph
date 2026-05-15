@@ -1,6 +1,6 @@
 import React from "react";
 
-const SYMBOLS = "000001.SS,399001.SZ,399006.SZ,^HSI,^GSPC,^NDX,^N225,1306.T,CNY=X,GC=F,BZ=F";
+const SYMBOLS = "000001.SS,399001.SZ,399006.SZ,^HSI,^GSPC,^NDX,^N225,1306.T,CNY=X,JPY=X,GC=F,BZ=F";
 
 const LABELS: Record<string, string> = {
   "000001.SS": "上证指数",
@@ -12,6 +12,7 @@ const LABELS: Record<string, string> = {
   "^N225":     "日经225",
   "1306.T":    "TOPIX",
   "CNY=X":     "美元/人民币",
+  "JPY=X":     "美元/日元",
   "GC=F":      "COMEX金",
   "BZ=F":      "布伦特原油",
 };
