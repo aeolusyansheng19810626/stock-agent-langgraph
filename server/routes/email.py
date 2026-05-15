@@ -6,8 +6,6 @@ import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from tools import send_email_report
-
 router = APIRouter()
 
 
@@ -21,6 +19,7 @@ class EmailRequest(BaseModel):
 async def send_email(req: EmailRequest) -> dict:
     if not req.to or "@" not in req.to:
         raise HTTPException(status_code=400, detail="Invalid recipient address.")
+    from tools import send_email_report
     raw = send_email_report.invoke({"to": req.to, "subject": req.subject, "body": req.body})
     try:
         return json.loads(raw)

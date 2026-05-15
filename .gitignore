@@ -15,4 +15,4 @@ web/node_modules/
 web/dist/
 web/.vite/
 design_handoff_stockai/
-main.py
+/main.py
