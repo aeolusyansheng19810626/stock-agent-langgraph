@@ -50,7 +50,7 @@ export const TopNav: React.FC = () => {
         <button className="sx-icon-btn" aria-label="设置" onClick={() => setOpen(true)}>
           <Icon name="settings" />
         </button>
-        <div className="sx-avatar">陈</div>
+        <div className="sx-avatar">YS</div>
       </div>
     </header>
   );
