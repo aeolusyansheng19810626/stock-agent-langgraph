@@ -1,3 +1,12 @@
+---
+title: StockAI 股票分析 Agent
+emoji: 📈
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # StockAI 股票分析 Agent
 
 基于 **LangGraph** 的多 Agent 并行股票分析助手；**FastAPI 后端 + React 前端**，SSE 流式协议驱动报告分段渲染。
