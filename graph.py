@@ -1,5 +1,6 @@
 """LangGraph multi-agent graph for stock analysis."""
 
+import contextvars
 import json
 import logging
 import operator
@@ -7,10 +8,11 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Annotated, List, Optional, TypedDict
+from typing import Annotated, Callable, List, Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from tools import (
@@ -88,14 +90,37 @@ TIER_DEBUG     = "llama-3.1-8b-instant"
 # Quality 节点从上到下依次降级；Fast 节点直接用 TIER_LOW，不降级
 QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
+# ── Vertex AI Gemini ──────────────────────────────────────────────────────────
+_gcp_project    = os.getenv("GOOGLE_CLOUD_PROJECT", "yansheng-project")
+_gcp_region     = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
+GEMINI_BASE_URL = (
+    f"https://{_gcp_region}-aiplatform.googleapis.com/v1beta1/projects/"
+    f"{_gcp_project}/locations/{_gcp_region}/endpoints/openapi/"
+)
+GEMINI_FLASH = "google/gemini-2.5-flash"
+GEMINI_PRO   = "google/gemini-2.5-pro"
+
 def get_visual_cascade():
     """有图片时使用的模型层级（跳过两个llama）"""
     return [TIER_TOP, TIER_UPPER_MID, TIER_MID]
 
 RATE_LIMIT_KEYWORDS = ("429", "rate_limit", "rate limit", "503", "over_capacity", "model_overloaded")
 
-# Streaming callback injected by app.py before each report generation; None = no streaming
-_report_streaming_cb = None
+# Streaming callback set per-request via set_streaming_cb(); None = no streaming.
+# Uses ContextVar so concurrent FastAPI requests do not clobber each other and
+# child threads inherit the value via contextvars.copy_context().run().
+_report_streaming_cb: "contextvars.ContextVar[Optional[Callable[[str], None]]]" = (
+    contextvars.ContextVar("report_streaming_cb", default=None)
+)
+
+
+def set_streaming_cb(cb: Optional[Callable[[str], None]]) -> contextvars.Token:
+    """Install a streaming callback for the current context. Returns a token to reset()."""
+    return _report_streaming_cb.set(cb)
+
+
+def reset_streaming_cb(token: contextvars.Token) -> None:
+    _report_streaming_cb.reset(token)
 
 # Fast 节点（data/news）直接使用的单一模型
 DATA_AGENT_MODEL = TIER_LOW
@@ -354,13 +379,14 @@ def hypothesis_node(state: AgentState) -> dict:
     _hyp_usage = None
 
     try:
-        raw, hypothesis_model, _hyp_usage = _invoke_with_cascade(
+        raw, hypothesis_model, _hyp_usage = _invoke_gemini_with_fallback(
             [
                 SystemMessage(content=HYPOTHESIS_SYSTEM),
                 HumanMessage(content=f"背景数据：\n{context}\n\n用户假设请求：{state['user_input']}")
             ],
-            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW],
+            fast=False,
+            groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            groq_cascade=[TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW],
         )
         hypothesis_result = _parse_json_from_text(raw)
         if not hypothesis_result:
@@ -406,13 +432,14 @@ def deep_read_node(state: AgentState) -> dict:
     s1_model = QUALITY_CASCADE[0]
     _s1_usage = None
     try:
-        raw1, s1_model, _s1_usage = _invoke_with_cascade(
+        raw1, s1_model, _s1_usage = _invoke_gemini_with_fallback(
             [
                 SystemMessage(content=DEEP_READ_STAGE1_SYSTEM),
                 HumanMessage(content=f"内容：\n{context}")
             ],
-            api_key,
-            DEEP_READ_S1_CASCADE
+            fast=True,
+            groq_api_key=api_key,
+            groq_cascade=DEEP_READ_S1_CASCADE,
         )
         s1_result = _parse_json_from_text(raw1)
     except Exception as exc:
@@ -424,13 +451,14 @@ def deep_read_node(state: AgentState) -> dict:
     _s2_usage = None
     if s1_result:
         try:
-            raw2, s2_model, _s2_usage = _invoke_with_cascade(
+            raw2, s2_model, _s2_usage = _invoke_gemini_with_fallback(
                 [
                     SystemMessage(content=DEEP_READ_STAGE2_SYSTEM),
                     HumanMessage(content=f"核心内容：\n{json.dumps(s1_result, ensure_ascii=False)}")
                 ],
-                api_key,
-                DEEP_READ_S2_CASCADE
+                fast=False,
+                groq_api_key=api_key,
+                groq_cascade=DEEP_READ_S2_CASCADE,
             )
             s2_result = _parse_json_from_text(raw2)
         except Exception as exc:
@@ -500,6 +528,51 @@ def _invoke_with_cascade(messages: list, api_key: str, tiers: list, temperature:
                 continue
             raise
     raise last_exc
+
+
+def _get_gcp_token() -> str:
+    try:
+        import google.auth
+        import google.auth.transport.requests as _gat
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        creds.refresh(_gat.Request())
+        return creds.token
+    except Exception as exc:
+        raise RuntimeError(f"GCP ADC unavailable: {exc}") from exc
+
+
+def _make_gemini_llm(model: str) -> ChatOpenAI:
+    return ChatOpenAI(model=model, base_url=GEMINI_BASE_URL, api_key=_get_gcp_token(), temperature=0.1)
+
+
+def _invoke_gemini_with_fallback(
+    messages: list,
+    fast: bool,
+    groq_api_key: str,
+    groq_cascade: list,
+    cb=None,
+) -> tuple[str, str, dict | None]:
+    """先试 Vertex AI Gemini（fast→Flash / quality→Pro），失败后 fallback 到 Groq cascade。"""
+    gemini_model = GEMINI_FLASH if fast else GEMINI_PRO
+    try:
+        llm = _make_gemini_llm(gemini_model)
+        if cb:
+            text, usage = _stream_with_cb(llm, messages, cb)
+        else:
+            resp = llm.invoke(messages)
+            text = _extract_text(resp.content)
+            um = getattr(resp, "usage_metadata", None)
+            usage = {
+                "prompt_tokens":     um.get("input_tokens", 0),
+                "completion_tokens": um.get("output_tokens", 0),
+                "total_tokens":      um.get("total_tokens", 0),
+            } if um else None
+        if text and text.strip():
+            return text, gemini_model, usage
+        logger.warning("Gemini %s returned empty, falling back to Groq", gemini_model)
+    except Exception as exc:
+        logger.warning("Gemini %s failed: %s, falling back to Groq", gemini_model, exc)
+    return _invoke_with_cascade(messages, groq_api_key, groq_cascade)
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -800,7 +873,9 @@ def parse_node(state: AgentState) -> dict:
 
     _parse_usage = None
     try:
-        raw_text, model_used, _parse_usage = _invoke_with_cascade(plan_messages, api_key, QUALITY_CASCADE)
+        raw_text, model_used, _parse_usage = _invoke_gemini_with_fallback(
+            plan_messages, fast=False, groq_api_key=api_key, groq_cascade=QUALITY_CASCADE
+        )
         raw_plan = _parse_plan(raw_text)
     except Exception as exc:
         planner_error = str(exc)
@@ -885,25 +960,21 @@ def data_node(state: AgentState) -> dict:
     analysis = raw_text  # 默认 fallback 为原始数据
     if raw_text.strip():
         try:
-            llm = ChatGroq(
-                api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-                model=DATA_AGENT_MODEL,
-            )
-            resp = llm.invoke([
+            _d_msgs = [
                 SystemMessage(content=DATA_AGENT_SYSTEM),
                 HumanMessage(content=f"原始数据：\n{raw_text}"),
-            ])
-            analysis_text = _extract_text(resp.content).strip()
+            ]
+            analysis_text, _data_model, _data_usage = _invoke_gemini_with_fallback(
+                _d_msgs, fast=True,
+                groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+                groq_cascade=[DATA_AGENT_MODEL],
+            )
+            analysis_text = analysis_text.strip()
             if analysis_text:
                 analysis = f"[技术面分析 by data_agent]\n{analysis_text}\n\n[原始数据]\n{raw_text}"
-                tool_calls.append({"tool_name": "llm", "tool_args": {"node": "data", "model": DATA_AGENT_MODEL}})
-                _um = getattr(resp, "usage_metadata", None)
-                if _um:
-                    tool_calls.append({"node": "data", "token_usage": {
-                        "prompt_tokens":     _um.get("input_tokens", 0),
-                        "completion_tokens": _um.get("output_tokens", 0),
-                        "total_tokens":      _um.get("total_tokens", 0),
-                    }})
+                tool_calls.append({"tool_name": "llm", "tool_args": {"node": "data", "model": _data_model}})
+                if _data_usage:
+                    tool_calls.append({"node": "data", "token_usage": _data_usage})
         except Exception as exc:
             errors.append({
                 "node": "data_node",
@@ -941,25 +1012,21 @@ def news_node(state: AgentState) -> dict:
     # LLM post-reasoning: 对新闻原文做摘要与情绪分析
     analysis = f"[Web News]\n{raw_result}"  # 默认 fallback
     try:
-        llm = ChatGroq(
-            api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            model=NEWS_AGENT_MODEL,
-        )
-        resp = llm.invoke([
+        _n_msgs = [
             SystemMessage(content=NEWS_AGENT_SYSTEM),
             HumanMessage(content=f"新闻原文：\n{raw_result}"),
-        ])
-        analysis_text = _extract_text(resp.content).strip()
+        ]
+        analysis_text, _news_model, _news_usage = _invoke_gemini_with_fallback(
+            _n_msgs, fast=True,
+            groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            groq_cascade=[NEWS_AGENT_MODEL],
+        )
+        analysis_text = analysis_text.strip()
         if analysis_text:
             analysis = f"[新闻摘要 by news_agent]\n{analysis_text}\n\n[原始新闻]\n{raw_result}"
-            tool_calls.append({"tool_name": "llm", "tool_args": {"node": "news", "model": NEWS_AGENT_MODEL}})
-            _um = getattr(resp, "usage_metadata", None)
-            if _um:
-                tool_calls.append({"node": "news", "token_usage": {
-                    "prompt_tokens":     _um.get("input_tokens", 0),
-                    "completion_tokens": _um.get("output_tokens", 0),
-                    "total_tokens":      _um.get("total_tokens", 0),
-                }})
+            tool_calls.append({"tool_name": "llm", "tool_args": {"node": "news", "model": _news_model}})
+            if _news_usage:
+                tool_calls.append({"node": "news", "token_usage": _news_usage})
     except Exception as exc:
         errors.append({
             "node": "news_node",
@@ -995,10 +1062,11 @@ def rag_node(state: AgentState) -> dict:
     analysis = f"[Document Retrieval]\n{raw_result}"  # 默认 fallback
     _rag_usage = None
     try:
-        analysis_text, rag_model, _rag_usage = _invoke_with_cascade(
+        analysis_text, rag_model, _rag_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=RAG_AGENT_SYSTEM), HumanMessage(content=f"检索到的财报段落：\n{raw_result}")],
-            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            QUALITY_CASCADE,
+            fast=True,
+            groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            groq_cascade=QUALITY_CASCADE,
         )
         analysis_text = analysis_text.strip()
         if analysis_text:
@@ -1050,10 +1118,11 @@ def scoring_node(state: AgentState) -> dict:
     _scoring_usage = None
 
     try:
-        raw, scoring_model, _scoring_usage = _invoke_with_cascade(
+        raw, scoring_model, _scoring_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=SCORING_SYSTEM), HumanMessage(content=f"请对以下数据进行多维度评分：\n\n{context}")],
-            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            QUALITY_CASCADE,
+            fast=True,
+            groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            groq_cascade=QUALITY_CASCADE,
         )
         raw = raw.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
@@ -1119,10 +1188,11 @@ def risk_node(state: AgentState) -> dict:
     _risk_usage = None
 
     try:
-        raw, risk_model, _risk_usage = _invoke_with_cascade(
+        raw, risk_model, _risk_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=RISK_SYSTEM), HumanMessage(content=f"请分析以下数据中的风险：\n\n{context}")],
-            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            RISK_MODEL_CASCADE,
+            fast=False,
+            groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            groq_cascade=RISK_MODEL_CASCADE,
         )
         raw = raw.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
@@ -1192,10 +1262,11 @@ def comparison_node(state: AgentState) -> dict:
     _cmp_usage = None
 
     try:
-        raw, comparison_model, _cmp_usage = _invoke_with_cascade(
+        raw, comparison_model, _cmp_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=COMPARISON_SYSTEM), HumanMessage(content=f"请对以下股票进行逐项对比：\n\n{context}")],
-            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            COMPARISON_MODEL_CASCADE,
+            fast=False,
+            groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            groq_cascade=COMPARISON_MODEL_CASCADE,
         )
         raw = raw.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
@@ -1592,7 +1663,7 @@ def report_node(state: AgentState) -> dict:
 
     def call_groq() -> tuple[str, str, dict | None]:
         _has_image = bool(state.get("image_data") and isinstance(state.get("image_data"), str) and len(state.get("image_data")) > 100)
-        _cb = _report_streaming_cb
+        _cb = _report_streaming_cb.get()
         # 有图片时先用视觉级联；如多模态不支持则自动降级为纯文字 + 全级联
         cascade = get_visual_cascade() if _has_image else _QC
         _msgs = messages  # 默认用多模态消息（有图时）
@@ -1648,23 +1719,16 @@ def report_node(state: AgentState) -> dict:
             final_model = "none"
         new_gemini_exhausted = False
     else:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
-
         response = None
         final_model = "Groq"
         new_gemini_exhausted = False
-        gemini_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            google_api_key=gemini_api_key,
-            temperature=0.1,
-        )
 
         # 根据是否有图，选择发给 Gemini 的消息格式
         _gem_msgs = messages if state.get("image_data") else _text_only_messages
+        _cb_gem = _report_streaming_cb.get()
 
-        _cb_gem = _report_streaming_cb
         try:
+            gemini_llm = _make_gemini_llm(GEMINI_PRO)
             if _cb_gem:
                 text, _gem_usage = _stream_with_cb(gemini_llm, _gem_msgs, _cb_gem)
             else:
@@ -1678,20 +1742,16 @@ def report_node(state: AgentState) -> dict:
                 } if _um else None
             if text and text.strip():
                 response = text
-                final_model = "Gemini-2.5-Flash"
+                final_model = GEMINI_PRO
                 _report_usage = _gem_usage
             else:
-
-                logger.warning("Gemini returned empty or whitespace-only text.")
+                logger.warning("Gemini Pro returned empty, falling back to Groq.")
                 response, final_model, _report_usage = call_groq()
-
         except Exception as exc:
             err = str(exc)
-            logger.warning(f"Gemini failed ({_gem_msgs[0].content if _gem_msgs else 'no msgs'}), falling back to Groq: {err}")
+            logger.warning("Gemini Pro failed in report_node, falling back to Groq: %s", err)
             new_gemini_exhausted = any(k in err for k in ("RESOURCE_EXHAUSTED", "429"))
             response, final_model, _report_usage = call_groq()
-
-
 
         if response is None:
             response, final_model, _report_usage = call_groq()
@@ -1715,8 +1775,9 @@ def report_node(state: AgentState) -> dict:
         response = f"{response.rstrip()}\n\n{deep_read_section}"
 
     # Push any appended structural sections to streaming callback
-    if _report_streaming_cb and len(response) > len(_llm_response.rstrip()):
-        _report_streaming_cb(response[len(_llm_response.rstrip()):])
+    _cb_tail = _report_streaming_cb.get()
+    if _cb_tail and len(response) > len(_llm_response.rstrip()):
+        _cb_tail(response[len(_llm_response.rstrip()):])
 
     email_tool_calls = []
     email_errors = []
@@ -1793,10 +1854,11 @@ def reflection_node(state: AgentState) -> dict:
     _ref_usage = None
     errors = []
     try:
-        raw, reflection_model, _ref_usage = _invoke_with_cascade(
+        raw, reflection_model, _ref_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=REFLECTION_SYSTEM), HumanMessage(content=f"股票分析报告：\n\n{report}")],
-            state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
-            REFLECTION_MODEL_CASCADE,
+            fast=False,
+            groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
+            groq_cascade=REFLECTION_MODEL_CASCADE,
         )
         parsed = _parse_json_from_text(raw)
         if not parsed:

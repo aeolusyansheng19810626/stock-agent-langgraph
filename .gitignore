@@ -4,7 +4,15 @@ __pycache__/
 *.pyo
 charts/
 *.json
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json
 .env
 token.pickle
 vectorstore/
-token.pickle 
+tmp/
+web/node_modules/
+web/dist/
+web/.vite/
+design_handoff_stockai/
+main.py

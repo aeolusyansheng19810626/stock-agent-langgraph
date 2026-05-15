@@ -1,22 +1,39 @@
 # StockAI 股票分析 Agent
 
-基于 **LangGraph** 的多 Agent 并行股票分析助手，Streamlit Web UI，支持 report_node 逐字流式输出。
+基于 **LangGraph** 的多 Agent 并行股票分析助手；**FastAPI 后端 + React 前端**，SSE 流式协议驱动报告分段渲染。
 
 ---
 
 ## 启动方式
 
+### 开发模式（前后端分离）
+
 ```bash
-# 激活虚拟环境
-source venv/Scripts/activate   # Windows (bash)
-# 或
-venv\Scripts\activate          # Windows (cmd/PowerShell)
-
-# 安装依赖（首次）
+# 后端（终端 1）
 pip install -r requirements.txt
+python -m uvicorn server.main:app --reload --port 8000
 
-# 启动
-python -m streamlit run app.py
+# 前端（终端 2）
+cd web
+npm install
+npm run dev          # → http://localhost:5173 ，自动 proxy /api 到 :8000
+```
+
+### 生产模式（单口）
+
+```bash
+cd web && npm run build && cd ..
+python -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+# FastAPI 同时 serve API 与 web/dist 静态资源 → http://localhost:8000
+```
+
+### Docker
+
+```bash
+docker build -t stockai .
+docker run -p 7860:7860 \
+  -e GROQ_API_KEY=xxx -e GEMINI_API_KEY=yyy -e TAVILY_API_KEY=zzz \
+  stockai
 ```
 
 ---
@@ -25,7 +42,35 @@ python -m streamlit run app.py
 
 ```
 stock-agent-langgraph/
-├── app.py                       # Streamlit Web UI（主程序）
+├── server/                      # FastAPI 后端
+│   ├── main.py                  # app 实例 + 路由注册 + StaticFiles
+│   ├── sse.py                   # 线程→asyncio.Queue→SSE 帧 桥接
+│   ├── events.py                # SSE 事件类型常量（与 web/src/types/sse.ts 镜像）
+│   ├── routes/
+│   │   ├── analyze.py           # POST /api/analyze（SSE 流，包 graph.stream）
+│   │   ├── _analyze_graph.py    # graph→SSE 事件分发逻辑
+│   │   ├── docs.py              # PDF 上传 / 列表 / 删除
+│   │   ├── quote.py             # yfinance 批量行情
+│   │   ├── history.py           # 历史记录 read / clear
+│   │   └── email.py             # 手动邮件发送
+│   └── services/
+│       ├── pdf_ingest.py        # PDF → ChromaDB 入库（无 streamlit 依赖）
+│       └── image.py             # 图片→512px PNG→base64
+├── web/                         # Vite + React 18 + TS 前端
+│   ├── src/
+│   │   ├── App.tsx              # 三栏 grid + 主题切换
+│   │   ├── styles/stockai.css   # 设计系统（三主题 CSS 变量）
+│   │   ├── layout/              # TopNav / Ticker / Sidebar / MainArea / ContextPanel / SettingsDrawer
+│   │   ├── sidebar/             # Watchlist / UploadZone / DocumentList
+│   │   ├── chat/                # ChatStream / Composer / Markdown / StepRow / SuggestionGrid
+│   │   ├── report/              # ReportCard / KpiGrid / CandleChart / VerdictCards / Sparkline
+│   │   ├── context/             # QuoteCard / NewsList / FilingsList
+│   │   ├── icons/Icon.tsx       # 16 个内联 SVG
+│   │   ├── api/                 # client.ts（fetch wrapper）+ sse.ts（fetch-event-source）
+│   │   ├── store/               # zustand: chat / settings / docs / watchlist
+│   │   └── types/sse.ts         # SSE 事件 TS 镜像
+│   ├── vite.config.ts           # /api 与 /charts 反向代理到 :8000
+│   └── package.json
 ├── graph.py                     # LangGraph 多 Agent 图（核心）
 ├── tools.py                     # 工具定义（不要修改）
 ├── history.py                   # 对话历史记录（history.json）
@@ -34,14 +79,16 @@ stock-agent-langgraph/
 ├── tools/
 │   ├── sec_fetcher.py           # SEC 财报抓取
 │   └── cn_report_fetcher.py     # A股财报抓取
-├── components/
-│   └── stock_ticker.py          # 实时股价侧边栏组件（@st.fragment 30s刷新）
 ├── skills/                      # 工具使用说明（注入 system prompt）
-├── charts/                      # 走势图输出目录（运行时自动创建）
+├── charts/                      # 走势图输出目录（运行时自动创建，FastAPI 静态托管 /charts）
 ├── vectorstore/                 # ChromaDB 向量库（运行时自动创建，不上传 git）
+├── design_handoff_stockai/      # UI 设计交付包（重构源材料）
+├── Dockerfile                   # 多阶段：node build web/ → python runtime
 ├── .env                         # API Keys（不上传 git，参考 .env.example）
 └── requirements.txt
 ```
+
+> 旧版 `app.py`（Streamlit）已于 UI 重构时移除；如需对照请查看 git history 4b16b4b 之前的版本。
 
 ---
 
@@ -92,9 +139,9 @@ report_node
 
 ## 多模态支持 (Image Analysis)
 
-系统现在支持 **JPG/PNG/WEBP** 格式图片的上传与分析：
-- **上传方式**：Streamlit 聊天输入框内嵌的 `+` 号按钮（利用 `st.chat_input(accept_file=True)`）。
-- **处理流程**：图片在前端自动压缩（512x512）并转为 Base64，存入 `AgentState["image_data"]`。
+系统支持 **JPG/PNG/WEBP** 格式图片的上传与分析：
+- **上传方式**：Composer 工具栏「附件」按钮，浏览器原生 `<input type=file>`。
+- **处理流程**：前端读为 base64，随 `POST /api/analyze` 一并提交（`image_b64` 字段）；后端写入 `AgentState["image_data"]`。前端不再压缩，过 2MB 直接拒绝。
 - **智能调度**：`parse_node` 识别到图片后，会自动在提示词中注入视觉分析指令，并引导 `report_node` 开启多模态链路。
 - **模型限制**：有图片时，`report_node` 会自动跳过不支持视觉的 Llama 模型，优先尝试顶级视觉模型层级。
 
@@ -125,24 +172,41 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
 ---
 
-## 流式输出架构
+## 流式输出架构（SSE 协议）
 
-`report_node` 支持逐 token 流式输出，让报告边生成边显示在 UI 中：
+`report_node` 支持逐 token 流式输出。整条链路：
 
 ```
-graph.py                                  app.py（主线程）
-────────────────────────────              ──────────────────────────────
-_report_streaming_cb = None    ←──注入── lambda t: token_q.put(t)
-                                          │
-report_node 调用 llm.stream()             _steps_ph = st.empty()  ← 步骤卡片占位符（chat_message 之前）
-  每个 token → _report_streaming_cb       │
-  → token 入队 token_q                   with st.chat_message("assistant"):
-                                              st.write_stream(tok_gen())  ← 消费队列
-finally: token_q.put(None)  ────────→        阻塞直到队列 None 信号
+浏览器（fetch-event-source）           server/routes/analyze.py            graph.py
+─────────────────────────────         ─────────────────────────────       ──────────────────────────────────
+fetch /api/analyze (POST + body)  →   set_streaming_cb(emit)         →    _report_streaming_cb (ContextVar)
+                                                                          ↓ 子线程 contextvars.copy_context()
+                                      threading.Thread(graph.stream)      report_node 内部 llm.stream()
+                                          ↓ 每个 update                       每个 token → cb()
+                                      EventEmitter.emit(event, data) ←─┘ → emit(report.token, {delta})
+                                          ↓
+                                      asyncio.Queue → SSE 帧
+                                          ↓
+浏览器 useChat.appendToken(id, delta)  ← StreamingResponse
 ```
 
-- **后台线程**运行 `graph.stream()`，通过 `add_script_run_ctx` 传播 Streamlit session 上下文
-- **步骤卡片**：流式结束后一次性写入 `_steps_ph`（位于 chat_message 上方），脚本自然向下继续渲染，无需 `st.rerun()`，消除推理结束时的闪烁
+**SSE 事件协议**（`server/events.py` ↔ `web/src/types/sse.ts`）：
+
+| event | data | 用途 |
+|---|---|---|
+| `node.start`     | `{node, label}`                                    | 主区头部状态文字 |
+| `node.complete`  | `{node, payload?}`                                 | 结构化 payload 推给前端做 KPI / 估值卡分段渲染 |
+| `tool.call`      | `{step, tool_name, tool_args, retries}`            | 步骤卡片实时追加 |
+| `report.token`   | `{delta}`                                          | 主报告 token 流 |
+| `report.section` | `{type, markdown}`                                 | comparison / risk_matrix / hypothesis / deep_read 段落 |
+| `error`          | `{node, tool, message}`                            | 节点错误折叠区 |
+| `chart`          | `{path}`                                           | `charts/*.png` 推给前端从 `/charts/...` 加载 |
+| `done`           | `{final_model, final_report, email_status, ...}`   | 终态 |
+
+**关键点**：
+- `_report_streaming_cb` 是 `contextvars.ContextVar`，子线程用 `contextvars.copy_context().run(worker)` 启动以继承
+- LangGraph 的 `graph.stream(..., stream_mode="updates")` 是同步迭代器，FastAPI 用 worker 线程 + asyncio.Queue 桥接到 SSE
+- `node.complete.payload` 仅携带 `financial_metrics` / `scoring_result` / `risk_result` / `hypothesis_result` / `deep_read_result` 等结构化字段（白名单见 `_analyze_graph.PAYLOAD_KEYS`）
 
 ---
 
@@ -154,8 +218,8 @@ finally: token_q.put(None)  ────────→        阻塞直到队�
 | RPD | 20 |
 | 重置时间 | 北京时间 15:00 |
 
-- `RESOURCE_EXHAUSTED` → 自动标记 `gemini_exhausted=True`，后续直接走 Groq
-- 侧边栏「🔴 Gemini 已耗尽」按钮可手动恢复
+- `RESOURCE_EXHAUSTED` → SSE `done.gemini_exhausted=true`，前端 settings store 自动置位，后续请求带 `gemini_exhausted: true` 直接走 Groq
+- 设置抽屉里关掉「开发模式」开关 + 刷新页面即可重置
 
 ---
 
@@ -173,10 +237,12 @@ finally: token_q.put(None)  ────────→        阻塞直到队�
 
 ## UI 行为
 
-- **执行阶段**：状态栏实时更新节点进度 → 报告逐字流式输出
-- **完成后**：步骤卡片出现在报告上方，预设快捷提问卡片渲染在最新内容之后
-- **重试徽章**：工具调用遇到瞬态错误（超时 / 限速 / 网络）后自动重试，步骤卡片显示 `⟳ 重试 N/3`
-- **自我反思**：`need_reflection=True` 时，报告下方显示折叠的「自我反思」区块
+- **三栏布局**：左 240px 自选股 + PDF 文档；中央对话 + 报告卡；右 360px 上下文栏（行情/资讯/公告 三 tab）
+- **三套主题**：琥珀（默认）/ 电光青 / 墨绿，通过 CSS 变量切换，零重渲
+- **涨跌色翻转**：设置抽屉「红涨绿跌」开关一键切换 A 股 / 美股惯例
+- **流式渲染**：步骤卡片随 SSE `tool.call` 事件实时追加；报告 token 实时累积；`node.complete` 带结构化 payload 时渐进出 KPI / 估值卡
+- **重试徽章**：工具调用瞬态错误后自动重试，步骤卡片显示 `⟳ N/3`
+- **设置抽辑**：右上角齿轮按钮打开（220ms 三次贝塞尔滑入），含开发模式 / 引用必标注 / 红涨绿跌 / 自动邮件 / 数据源开关
 
 ---
 
@@ -191,15 +257,36 @@ finally: token_q.put(None)  ────────→        阻塞直到队�
 
 ## PDF 财报管理
 
-- **上传**：侧边栏「📄 财报文档」区域上传 PDF，自动写入 `tmp/` 并向量化到 ChromaDB
-- **删除**：每个已上传文件旁有 🗑 按钮，点击后同时清理：
+- **上传**：侧栏「财报文档」拖放区或点击浏览，`POST /api/docs`（multipart）→ 自动写入 `tmp/` 并向量化到 ChromaDB
+- **删除**：文档条目右侧 × 按钮，`DELETE /api/docs/{name}` 同时清理：
   - `tmp/` 中的原始 PDF 文件
   - ChromaDB 中该文件的所有向量片段
   - `vectorstore/processed_files.json` 中的注册记录
-- **扫描件处理**：若 PDF 无可提取文本（扫描件），跳过向量化但保留文件，仍可由 `financial_report_node` 通过 pdfplumber + Vision 精读
+- **扫描件处理**：若 PDF 无可提取文本，跳过向量化但保留文件，仍可由 `financial_report_node` 通过 pdfplumber + Vision 精读
 
 ## 注意事项
 
 - `tools.py` 不要修改，工具签名变更会影响 LangGraph 节点绑定
-- `graph.py` 修改后需重启 Streamlit（`@st.cache_resource` 不会自动失效）
+- `graph.py` 修改后需重启 uvicorn（`--reload` 模式下会自动重启）
 - `skills/*.md` 修改后立即生效（注入 system prompt，非 graph 节点）
+- 前端改 `web/src/`，dev 模式下 Vite HMR 自动更新；生产部署需重新 `npm run build`
+
+## 部署到 HuggingFace Spaces
+
+1. 在 HF 创建一个 **Docker** 类型的 Space（Spaces 的 Streamlit / Gradio 模板都不适用）
+2. 把本仓库 push 到该 Space 的 git 远端（`git remote add space https://huggingface.co/spaces/<user>/<name>`）
+3. Space Settings → Variables and secrets 里配置：
+   - `GROQ_API_KEY`、`GEMINI_API_KEY`、`TAVILY_API_KEY`
+4. Space 自动用根目录 `Dockerfile` 构建（多阶段：node:20 build web/ → python:3.11-slim runtime）
+5. 默认监听 7860，HF Space 自动反代到公网
+
+**已知约束**：
+- HF Free Tier 容器是 **ephemeral** 的：`tmp/`、`vectorstore/`、`charts/` 重启后丢失。需要持久化要开启 HF Persistent Storage（付费）
+- Gmail 邮件发送依赖 `token.pickle`，HF Space 跑不了 OAuth 交互流程；需要本地完成首次授权后把 token 一起 push（注意它是认证凭证，不要 push 到公开 Space）
+
+**本地 Docker 验证**：
+```bash
+docker build -t stockai .
+docker run -p 7860:7860 -e GROQ_API_KEY=xxx -e GEMINI_API_KEY=yyy -e TAVILY_API_KEY=zzz stockai
+# 浏览器打开 http://localhost:7860
+```
