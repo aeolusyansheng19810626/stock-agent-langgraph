@@ -18,4 +18,4 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           git remote add space https://aeolusyansheng:$HF_TOKEN@huggingface.co/spaces/aeolusyansheng/stock-agent-langgraph
-          git push space master --force
+          git push space master:main --force
