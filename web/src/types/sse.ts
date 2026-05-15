@@ -38,6 +38,7 @@ export interface DoneData {
   email_status:     string;
   gemini_exhausted: boolean;
   elapsed:          number;
+  tickers?:         string[];
 }
 
 export type SSEEvent =
