@@ -12,8 +12,22 @@ import type { AssistantMessage } from "../store/chat";
 export const ReportCard: React.FC<{ message: AssistantMessage }> = ({ message }) => {
   const recipient = useSettings((s) => s.emailRecipient);
   const setOpen   = useSettings((s) => s.setOpen);
-  const activeSym = useWatchlist((s) => s.active);
-  const quote     = useWatchlist((s) => (activeSym ? s.quotes[activeSym] : undefined));
+  const activeSym  = useWatchlist((s) => s.active);
+  const watchQuote = useWatchlist((s) => (activeSym ? s.quotes[activeSym] : undefined));
+
+  // Prefer the ticker from this specific analysis; fall back to watchlist active symbol.
+  const analysisTicker = message.tickers?.[0] ?? null;
+  const [analysisQuote, setAnalysisQuote] = React.useState<typeof watchQuote>(undefined);
+
+  React.useEffect(() => {
+    if (!analysisTicker) return;
+    fetch(`/api/quote?symbols=${analysisTicker}`)
+      .then((r) => r.json())
+      .then((d) => { const q = d.quotes?.[0]; if (q) setAnalysisQuote(q); })
+      .catch(() => {});
+  }, [analysisTicker]);
+
+  const quote = analysisQuote ?? (analysisTicker ? undefined : watchQuote);
   const [range, setRange] = React.useState<"日" | "周" | "1月" | "3月" | "1年" | "5年">("3月");
 
   const onCopy     = () => navigator.clipboard?.writeText(message.text);

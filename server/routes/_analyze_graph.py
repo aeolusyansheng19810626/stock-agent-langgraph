@@ -179,6 +179,7 @@ def run_graph(emitter: EventEmitter, req: Any) -> None:
             "email_status":     email_status,
             "gemini_exhausted": new_gemini_exhausted,
             "elapsed":          round(time.time() - started, 2),
+            "tickers":          tickers,
         })
     except Exception as exc:
         import traceback

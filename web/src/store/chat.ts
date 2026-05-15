@@ -12,6 +12,7 @@ export interface AssistantMessage {
   finalModel: string;
   emailStatus:string;
   elapsed?:   number;
+  tickers?:   string[];
   pending:    boolean;                             // true while streaming
 }
 

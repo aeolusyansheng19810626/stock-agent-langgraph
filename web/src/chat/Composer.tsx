@@ -92,6 +92,7 @@ export const Composer: React.FC = () => {
                 emailStatus: e.data.email_status,
                 elapsed:     e.data.elapsed,
                 text:        e.data.final_report || undefined,
+                tickers:     e.data.tickers ?? [],
               });
               setStatus("");
               break;
