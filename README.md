@@ -45,7 +45,7 @@ docker run -p 7860:7860 \
   -e TAVILY_API_KEY=zzz \
   -e GCP_SA_KEY="$(base64 -w0 /path/to/sa-key.json)" \
   -e GOOGLE_CLOUD_PROJECT=your-project \
-  -e GOOGLE_CLOUD_REGION=us-central1 \
+  -e GOOGLE_CLOUD_REGION=global \
   stockai
 ```
 
@@ -111,7 +111,7 @@ stock-agent-langgraph/
 GROQ_API_KEY=          # Groq API key（Gemini 失败时 fallback）
 TAVILY_API_KEY=        # Tavily 新闻搜索
 GOOGLE_CLOUD_PROJECT=  # GCP 项目 ID（默认 yansheng-project）
-GOOGLE_CLOUD_REGION=   # Vertex AI 区域（默认 us-central1）
+GOOGLE_CLOUD_REGION=   # Vertex AI 区域（默认 global，可设为 us-central1 等）
 ```
 
 **GCP 认证**：本地开发使用 `gcloud auth application-default login`（ADC）；
@@ -172,8 +172,8 @@ report_node
 ### 主力：Vertex AI Gemini（所有节点首选）
 
 ```python
-GEMINI_FLASH = "google/gemini-2.5-flash"  # 速度优先节点
-GEMINI_PRO   = "google/gemini-2.5-pro"    # 质量优先节点
+GEMINI_FLASH = "google/gemini-3.5-flash"        # 速度优先节点
+GEMINI_PRO   = "google/gemini-3.1-pro-preview"  # 质量优先节点
 ```
 
 | 节点 | 主力模型 | Groq Fallback |
@@ -306,7 +306,7 @@ fetch /api/analyze (POST + body)  →   set_streaming_cb(emit)         →    _r
 | `TAVILY_API_KEY` | Tavily 新闻搜索 |
 | `GCP_SA_KEY` | GCP Service Account JSON 的 base64 编码（`base64 -w0 key.json`） |
 | `GOOGLE_CLOUD_PROJECT` | GCP 项目 ID |
-| `GOOGLE_CLOUD_REGION` | Vertex AI 区域（如 `us-central1`） |
+| `GOOGLE_CLOUD_REGION` | Vertex AI 区域（默认 `global`，可设 `us-central1` 等） |
 
 push master 后 GitHub Actions 将代码同步到 HF，HF 自动 Docker build，监听 7860 端口。
 

@@ -92,13 +92,17 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
 # ── Vertex AI Gemini ──────────────────────────────────────────────────────────
 _gcp_project    = os.getenv("GOOGLE_CLOUD_PROJECT", "yansheng-project")
-_gcp_region     = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
+_gcp_region     = os.getenv("GOOGLE_CLOUD_REGION", "global")
+# global location 走的是无 region 前缀的 host；regional location 走 {region}-aiplatform host
 GEMINI_BASE_URL = (
-    f"https://{_gcp_region}-aiplatform.googleapis.com/v1beta1/projects/"
-    f"{_gcp_project}/locations/{_gcp_region}/endpoints/openapi/"
+    f"https://aiplatform.googleapis.com/v1beta1/"
+    f"projects/{_gcp_project}/locations/global/endpoints/openapi/"
+    if _gcp_region == "global"
+    else f"https://{_gcp_region}-aiplatform.googleapis.com/v1beta1/"
+         f"projects/{_gcp_project}/locations/{_gcp_region}/endpoints/openapi/"
 )
-GEMINI_FLASH = "google/gemini-2.5-flash"
-GEMINI_PRO   = "google/gemini-2.5-pro"
+GEMINI_FLASH = "google/gemini-3.5-flash"
+GEMINI_PRO   = "google/gemini-3.1-pro-preview"
 
 def get_visual_cascade():
     """有图片时使用的模型层级（跳过两个llama）"""
