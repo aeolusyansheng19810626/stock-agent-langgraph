@@ -169,7 +169,9 @@ export const Composer: React.FC = () => {
           onKeyDown={onKey}
           autosuggestionsConfig={{
             textareaPurpose: "股票分析提问，例如分析特定股票的基本面、技术面、风险等",
-            chatApiConfigs: {},
+            chatApiConfigs: {
+              suggestionsApiConfig: { maxTokens: 20, stop: ["。", "？", "！", "\n"] },
+            },
           }}
         />
 
