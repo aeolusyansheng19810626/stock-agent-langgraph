@@ -14,6 +14,8 @@ tmp/
 web/node_modules/
 web/dist/
 web/.vite/
+.playwright-mcp/
+web/src/**/*.js
 design_handoff_stockai/
 /main.py
 *.png

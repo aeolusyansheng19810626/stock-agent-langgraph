@@ -5,6 +5,7 @@ import { SuggestionGrid } from "../chat/SuggestionGrid";
 import { useChat } from "../store/chat";
 import { useDocs } from "../store/docs";
 import { useWatchlist } from "../store/watchlist";
+import { useUI } from "../store/ui";
 
 export const MainArea: React.FC = () => {
   const status     = useChat((s) => s.status);
@@ -14,16 +15,8 @@ export const MainArea: React.FC = () => {
   const docs       = useDocs((s) => s.docs);
   const isStreaming = useChat((s) => !!s.activeAssistant);
 
-  // Quick injection: clicking a suggestion fills the textarea via a custom event
-  // (Composer holds the local state; we don't share it via store).
   const onPick = (q: string) => {
-    const ta = document.querySelector<HTMLTextAreaElement>(".sx-composer textarea");
-    if (ta) {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-      setter?.call(ta, q);
-      ta.dispatchEvent(new Event("input", { bubbles: true }));
-      ta.focus();
-    }
+    useUI.getState().setSuggestion(q);
   };
 
   const ctxLabel = activeSym

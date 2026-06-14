@@ -3,18 +3,19 @@ import { QuoteCard } from "../context/QuoteCard";
 import { NewsList } from "../context/NewsList";
 import { FilingsList } from "../context/FilingsList";
 import { useWatchlist } from "../store/watchlist";
-
-type CtxTab = "quote" | "news" | "filings";
+import { CopilotChat } from "@copilotkit/react-ui";
+import { useUI } from "../store/ui";
 
 export const ContextPanel: React.FC = () => {
-  const [tab, setTab] = React.useState<CtxTab>("quote");
+  const tab = useUI((s) => s.ctxTab);
+  const setTab = useUI((s) => s.setCtxTab);
   const sym   = useWatchlist((s) => s.active);
   const quote = useWatchlist((s) => (sym ? s.quotes[sym] : undefined));
 
   return (
     <aside className="sx-context">
       <div className="sx-ctx-tabs">
-        {([["quote", "行情"], ["news", "资讯"], ["filings", "公告"]] as const).map(([k, label]) => (
+        {([["quote", "行情"], ["news", "资讯"], ["filings", "公告"], ["copilot", "副驾驶"]] as const).map(([k, label]) => (
           <button
             key={k}
             className={`sx-ctx-tab ${tab === k ? "active" : ""}`}
@@ -39,6 +40,11 @@ export const ContextPanel: React.FC = () => {
         )}
         {tab === "news"    && <NewsList />}
         {tab === "filings" && <FilingsList />}
+        {tab === "copilot" && (
+          <div className="sx-ctx-copilot-wrap">
+            <CopilotChat />
+          </div>
+        )}
       </div>
     </aside>
   );

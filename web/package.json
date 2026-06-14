@@ -9,6 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@copilotkit/react-core": "^1.60.1",
+    "@copilotkit/react-textarea": "^1.60.1",
+    "@copilotkit/react-ui": "^1.60.1",
     "@microsoft/fetch-event-source": "^2.0.1",
     "marked": "^18.0.3",
     "react": "^18.3.1",

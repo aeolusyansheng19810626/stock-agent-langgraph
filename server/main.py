@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="StockAI", lifespan=lifespan)
+app = FastAPI(title="StockAI", lifespan=lifespan, redirect_slashes=True)
 
 # Dev: vite dev server on :5173 hits this on :8000. Prod: same origin, CORS unused.
 app.add_middleware(
@@ -60,6 +60,13 @@ app.include_router(docs.router,    prefix="/api")
 app.include_router(quote.router,   prefix="/api")
 app.include_router(history.router, prefix="/api")
 app.include_router(email.router,   prefix="/api")
+
+# CopilotKit 副驾驶 runtime
+try:
+    from server.routes import copilotkit as _ck
+    _ck.mount(app)
+except Exception as _ck_err:
+    logger.warning("CopilotKit endpoint not mounted: %s", _ck_err)
 
 
 @app.get("/api/health")

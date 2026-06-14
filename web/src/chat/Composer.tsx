@@ -5,6 +5,8 @@ import { useChat } from "../store/chat";
 import { useDocs } from "../store/docs";
 import { useSettings } from "../store/settings";
 import { useWatchlist } from "../store/watchlist";
+import { CopilotTextarea } from "@copilotkit/react-textarea";
+import { useUI } from "../store/ui";
 
 async function fileToB64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -24,7 +26,6 @@ export const Composer: React.FC = () => {
   const [imagePreview, setImagePreview] = React.useState<string | null>(null);
   const [deepRead, setDeepRead] = React.useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
-  const taRef = React.useRef<HTMLTextAreaElement>(null);
 
   const ch          = useChat();
   const messages    = useChat((s) => s.messages);
@@ -34,6 +35,15 @@ export const Composer: React.FC = () => {
   const settings    = useSettings();
 
   const pending = !!ch.activeAssistant;
+
+  const suggestion = useUI((s) => s.suggestion);
+  const clearSuggestion = useUI((s) => s.clearSuggestion);
+  React.useEffect(() => {
+    if (suggestion) {
+      setText(suggestion);
+      clearSuggestion();
+    }
+  }, [suggestion, clearSuggestion]);
 
   const submit = async () => {
     const userText = text.trim();
@@ -111,7 +121,7 @@ export const Composer: React.FC = () => {
     }
   };
 
-  const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const onKey = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       submit();
@@ -152,13 +162,15 @@ export const Composer: React.FC = () => {
           )}
         </div>
 
-        <textarea
-          ref={taRef}
+        <CopilotTextarea
           placeholder="请输入你的问题，例如：分析一下英伟达的股票…"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onValueChange={(v: string) => setText(v)}
           onKeyDown={onKey}
-          rows={1}
+          autosuggestionsConfig={{
+            textareaPurpose: "股票分析提问，例如分析特定股票的基本面、技术面、风险等",
+            chatApiConfigs: {},
+          }}
         />
 
         <div className="sx-composer-foot">
