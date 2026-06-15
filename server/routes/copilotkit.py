@@ -123,9 +123,10 @@ def _build_graph():
     from copilotkit import CopilotKitState
 
     async def chatbot(state: CopilotKitState) -> dict:
-        # Use same Vertex AI path as graph.py — avoids Developer API key requirement.
-        from graph import _make_gemini_llm, GEMINI_FLASH
-        llm = _make_gemini_llm(GEMINI_FLASH)
+        # Use GEMINI_PRO (no thinking mode) — GEMINI_FLASH is Gemini 2.5 Flash which
+        # requires thought_signature in tool calls, not handled by OpenAI-compat layer.
+        from graph import _make_gemini_llm, GEMINI_PRO
+        llm = _make_gemini_llm(GEMINI_PRO)
 
         ck = state.get("copilotkit") or {}
         frontend_actions = ck.get("actions") or []
