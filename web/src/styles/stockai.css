@@ -780,3 +780,33 @@ body {
 }
 .sx-root.variant-cyan.flip-color  { --up: oklch(0.72 0.20 25); --down: oklch(0.78 0.16 160); }
 .sx-root.variant-ink.flip-color   { --up: oklch(0.7 0.20 25);  --down: oklch(0.74 0.14 145); }
+
+/* ── Scrollbars ────────────────────────────────────────────── */
+.sx-root ::-webkit-scrollbar { width: 4px; height: 4px; }
+.sx-root ::-webkit-scrollbar-track { background: transparent; }
+.sx-root ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 2px; }
+.sx-root ::-webkit-scrollbar-thumb:hover { background: var(--fg-dimmer); }
+
+/* ── CopilotKit dark theme overrides ───────────────────────── */
+.sx-ctx-copilot-wrap {
+  --copilot-kit-background-color: var(--panel);
+  --copilot-kit-primary-color: var(--accent);
+  --copilot-kit-contrast-color: var(--accent-fg);
+  --copilot-kit-secondary-contrast-color: var(--fg);
+  --copilot-kit-muted-color: var(--fg-dim);
+  --copilot-kit-separator-color: var(--line);
+  --copilot-kit-scrollbar-color: var(--line-strong);
+  --copilot-kit-response-button-color: var(--fg-dim);
+  --copilot-kit-response-button-background-color: var(--panel-2);
+  height: 100%;
+}
+.sx-ctx-copilot-wrap .copilotKitChat { height: 100%; background: var(--panel); }
+.sx-ctx-copilot-wrap .copilotKitInput { background: var(--panel-2); border-color: var(--line); color: var(--fg); }
+.sx-ctx-copilot-wrap .copilotKitInput:focus-within { border-color: var(--accent); }
+.sx-ctx-copilot-wrap .copilotKitInputControls button { color: var(--fg-dim); }
+.sx-ctx-copilot-wrap .copilotKitInputControls button:hover { color: var(--fg); }
+.sx-ctx-copilot-wrap .copilotKitMessage { background: var(--panel-2); color: var(--fg); }
+.sx-ctx-copilot-wrap .copilotKitMessage.copilotKitUserMessage { background: color-mix(in oklch, var(--accent) 15%, var(--panel-2)); }
+.sx-ctx-copilot-wrap .copilotKitMessagesContainer { background: var(--panel); }
+.sx-ctx-copilot-wrap p, .sx-ctx-copilot-wrap span { color: var(--fg); }
+.sx-ctx-copilot-wrap [class*="PoweredBy"] { color: var(--fg-dimmer); }
