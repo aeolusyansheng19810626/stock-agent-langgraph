@@ -127,10 +127,10 @@ def _build_graph():
         # endpoint, and ag_ui_langgraph drops thought_signature on tool-call round-trips → 400.
         # Groq has no thought_signature mechanism; bind_tools works out of the box.
         from langchain_groq import ChatGroq
-        from graph import TIER_MID
+        from graph import TIER_LOW
         llm = ChatGroq(
             api_key=os.getenv("GROQ_API_KEY", ""),
-            model=TIER_MID,
+            model=TIER_LOW,
             temperature=0.1,
         )
 
