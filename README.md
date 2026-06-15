@@ -279,6 +279,7 @@ fetch /api/analyze (POST + body)  →   set_streaming_cb(emit)         →    _r
 - 后端：`server/routes/copilotkit.py`，LangGraph `StateGraph(CopilotKitState)` + `MemorySaver`
 - LLM：Groq `llama-4-scout-17b`（轻量任务，无 Gemini thinking 兼容问题）
 - 路由端点：`POST /api/copilotkit`，自定义 body-method dispatch（兼容 CopilotKit v1.60 单端点协议）
+- 传输协议：**AG-UI**（`ag_ui.core.types.RunAgentInput` + `ag_ui.encoder.EventEncoder`）— CopilotKit v1.60 前端与 LangGraph 后端之间的标准 Agent-User Interaction 协议，定义了 `TEXT_MESSAGE_*` / `TOOL_CALL_*` 等事件类型；`ag_ui_langgraph` 包提供 LangGraph 适配器
 - **不替代**主分析流程，深度股票分析仍走主输入框 → SSE pipeline
 
 > **注意**：Gemini 3 系列模型在 Vertex AI OpenAI 兼容端点上的 tool calling 强制要求 `thought_signature` 回传，而 `ag_ui_langgraph` 不处理此字段，故副驾驶 LLM 固定使用 Groq 以避免 400 错误。
