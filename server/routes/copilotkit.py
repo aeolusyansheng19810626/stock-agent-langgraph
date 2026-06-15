@@ -123,17 +123,15 @@ def _build_graph():
     from copilotkit import CopilotKitState
 
     async def chatbot(state: CopilotKitState) -> dict:
-        # Both Gemini models on this Vertex AI endpoint have thinking enabled by default.
-        # ag_ui_langgraph's tool-call loop doesn't pass thought_signature back, causing 400.
-        # Disable thinking via extra_body so tool calls work without thought_signature.
-        from graph import GEMINI_FLASH, GEMINI_BASE_URL, _get_gcp_token
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(
-            model=GEMINI_FLASH,
-            base_url=GEMINI_BASE_URL,
-            api_key=_get_gcp_token(),
+        # Gemini 3 (both Flash and Pro) cannot disable thinking on Vertex AI OpenAI-compat
+        # endpoint, and ag_ui_langgraph drops thought_signature on tool-call round-trips → 400.
+        # Groq has no thought_signature mechanism; bind_tools works out of the box.
+        from langchain_groq import ChatGroq
+        from graph import TIER_MID
+        llm = ChatGroq(
+            api_key=os.getenv("GROQ_API_KEY", ""),
+            model=TIER_MID,
             temperature=0.1,
-            extra_body={"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}},
         )
 
         ck = state.get("copilotkit") or {}
