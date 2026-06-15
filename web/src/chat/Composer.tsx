@@ -4,7 +4,6 @@ import { streamAnalyze } from "../api/sse";
 import { useChat } from "../store/chat";
 import { useDocs } from "../store/docs";
 import { useSettings } from "../store/settings";
-import { useWatchlist } from "../store/watchlist";
 import { useUI } from "../store/ui";
 
 async function fileToB64(file: File): Promise<string> {
@@ -28,7 +27,6 @@ export const Composer: React.FC = () => {
 
   const ch          = useChat();
   const messages    = useChat((s) => s.messages);
-  const activeSym   = useWatchlist((s) => s.active);
   const activeDoc   = useDocs((s) => s.docs[0]);
   const setStatus   = useChat((s) => s.setStatus);
   const settings    = useSettings();
@@ -142,11 +140,6 @@ export const Composer: React.FC = () => {
     <div className="sx-composer-wrap">
       <div className="sx-composer">
         <div className="sx-composer-chips">
-          {activeSym && (
-            <span className="sx-chip accent">
-              <span className="mono">{activeSym}</span>
-            </span>
-          )}
           {activeDoc && (
             <span className="sx-chip" title={activeDoc.name}>
               <Icon name="attach" size={11} />
