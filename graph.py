@@ -388,7 +388,7 @@ def hypothesis_node(state: AgentState) -> dict:
                 SystemMessage(content=HYPOTHESIS_SYSTEM),
                 HumanMessage(content=f"背景数据：\n{context}\n\n用户假设请求：{state['user_input']}")
             ],
-            fast=False,
+            fast=True,
             groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             groq_cascade=[TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW],
         )
@@ -460,7 +460,7 @@ def deep_read_node(state: AgentState) -> dict:
                     SystemMessage(content=DEEP_READ_STAGE2_SYSTEM),
                     HumanMessage(content=f"核心内容：\n{json.dumps(s1_result, ensure_ascii=False)}")
                 ],
-                fast=False,
+                fast=True,
                 groq_api_key=api_key,
                 groq_cascade=DEEP_READ_S2_CASCADE,
             )
@@ -878,7 +878,7 @@ def parse_node(state: AgentState) -> dict:
     _parse_usage = None
     try:
         raw_text, model_used, _parse_usage = _invoke_gemini_with_fallback(
-            plan_messages, fast=False, groq_api_key=api_key, groq_cascade=QUALITY_CASCADE
+            plan_messages, fast=True, groq_api_key=api_key, groq_cascade=QUALITY_CASCADE
         )
         raw_plan = _parse_plan(raw_text)
     except Exception as exc:
@@ -1194,7 +1194,7 @@ def risk_node(state: AgentState) -> dict:
     try:
         raw, risk_model, _risk_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=RISK_SYSTEM), HumanMessage(content=f"请分析以下数据中的风险：\n\n{context}")],
-            fast=False,
+            fast=True,
             groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             groq_cascade=RISK_MODEL_CASCADE,
         )
@@ -1268,7 +1268,7 @@ def comparison_node(state: AgentState) -> dict:
     try:
         raw, comparison_model, _cmp_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=COMPARISON_SYSTEM), HumanMessage(content=f"请对以下股票进行逐项对比：\n\n{context}")],
-            fast=False,
+            fast=True,
             groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             groq_cascade=COMPARISON_MODEL_CASCADE,
         )
@@ -1860,7 +1860,7 @@ def reflection_node(state: AgentState) -> dict:
     try:
         raw, reflection_model, _ref_usage = _invoke_gemini_with_fallback(
             [SystemMessage(content=REFLECTION_SYSTEM), HumanMessage(content=f"股票分析报告：\n\n{report}")],
-            fast=False,
+            fast=True,
             groq_api_key=state.get("groq_api_key") or os.getenv("GROQ_API_KEY", ""),
             groq_cascade=REFLECTION_MODEL_CASCADE,
         )
