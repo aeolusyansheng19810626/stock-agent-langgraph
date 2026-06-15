@@ -5,7 +5,6 @@ import { useChat } from "../store/chat";
 import { useDocs } from "../store/docs";
 import { useSettings } from "../store/settings";
 import { useWatchlist } from "../store/watchlist";
-import { CopilotTextarea } from "@copilotkit/react-textarea";
 import { useUI } from "../store/ui";
 
 async function fileToB64(file: File): Promise<string> {
@@ -162,17 +161,11 @@ export const Composer: React.FC = () => {
           )}
         </div>
 
-        <CopilotTextarea
+        <textarea
           placeholder="请输入你的问题，例如：分析一下英伟达的股票…"
           value={text}
-          onValueChange={(v: string) => setText(v)}
+          onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
-          autosuggestionsConfig={{
-            textareaPurpose: "股票分析提问，例如分析特定股票的基本面、技术面、风险等",
-            chatApiConfigs: {
-              suggestionsApiConfig: { maxTokens: 20, stop: ["。", "？", "！", "\n"] },
-            },
-          }}
         />
 
         <div className="sx-composer-foot">
