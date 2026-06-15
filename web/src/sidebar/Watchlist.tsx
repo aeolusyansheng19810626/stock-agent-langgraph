@@ -9,6 +9,7 @@ export const Watchlist: React.FC = () => {
   const active    = useWatchlist((s) => s.active);
   const setActive = useWatchlist((s) => s.setActive);
   const add       = useWatchlist((s) => s.add);
+  const remove    = useWatchlist((s) => s.remove);
   const refresh   = useWatchlist((s) => s.refresh);
 
   const [adding, setAdding] = React.useState(false);
@@ -71,6 +72,7 @@ export const Watchlist: React.FC = () => {
             quote={quotes[sym]}
             active={sym === active}
             onClick={() => setActive(sym)}
+            onRemove={() => remove(sym)}
           />
         ))}
       </div>

@@ -12,7 +12,8 @@ export const WatchlistItem: React.FC<{
   quote?: Quote;
   active: boolean;
   onClick: () => void;
-}> = ({ symbol, quote, active, onClick }) => {
+  onRemove: () => void;
+}> = ({ symbol, quote, active, onClick, onRemove }) => {
   const pct  = quote?.pct ?? 0;
   const up   = pct >= 0;
   const seed = symbol.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
@@ -28,6 +29,11 @@ export const WatchlistItem: React.FC<{
         {up ? "+" : ""}{pct.toFixed(2)}%
       </span>
       {active && <Sparkline seed={seed} up={up} />}
+      <button
+        className="sx-watch-del"
+        onClick={(e) => { e.stopPropagation(); onRemove(); }}
+        title="移除"
+      >×</button>
     </div>
   );
 };

@@ -224,6 +224,13 @@ body {
 }
 .sx-watch-item:hover { background: var(--panel-2); }
 .sx-watch-item.active { background: var(--panel-2); }
+.sx-watch-del {
+  display: none; position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; color: var(--fg-dim); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 2px 4px; border-radius: 3px;
+}
+.sx-watch-del:hover { color: var(--fg); background: var(--panel-3, #333); }
+.sx-watch-item:hover .sx-watch-del { display: block; }
 .sx-watch-item.active::before {
   content: ''; position: absolute; left: 0; top: 6px; bottom: 6px;
   width: 2px; background: var(--accent); border-radius: 1px;
