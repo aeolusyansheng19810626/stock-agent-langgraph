@@ -1732,7 +1732,7 @@ def report_node(state: AgentState) -> dict:
         _cb_gem = _report_streaming_cb.get()
 
         try:
-            gemini_llm = _make_gemini_llm(GEMINI_PRO)
+            gemini_llm = _make_gemini_llm(GEMINI_FLASH)
             if _cb_gem:
                 text, _gem_usage = _stream_with_cb(gemini_llm, _gem_msgs, _cb_gem)
             else:
@@ -1746,14 +1746,14 @@ def report_node(state: AgentState) -> dict:
                 } if _um else None
             if text and text.strip():
                 response = text
-                final_model = GEMINI_PRO
+                final_model = GEMINI_FLASH
                 _report_usage = _gem_usage
             else:
-                logger.warning("Gemini Pro returned empty, falling back to Groq.")
+                logger.warning("Gemini Flash returned empty, falling back to Groq.")
                 response, final_model, _report_usage = call_groq()
         except Exception as exc:
             err = str(exc)
-            logger.warning("Gemini Pro failed in report_node, falling back to Groq: %s", err)
+            logger.warning("Gemini Flash failed in report_node, falling back to Groq: %s", err)
             new_gemini_exhausted = any(k in err for k in ("RESOURCE_EXHAUSTED", "429"))
             response, final_model, _report_usage = call_groq()
 
