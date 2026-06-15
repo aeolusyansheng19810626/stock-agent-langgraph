@@ -50,6 +50,9 @@ def _fetch_one(ticker: str) -> Optional[dict[str, Any]]:
                 pass
 
         if price is None or prev is None:
+            # Indices like N225 / GSPC need a leading ^ in yfinance.
+            if not ticker.startswith("^"):
+                return _fetch_one("^" + ticker)
             return None
 
         info: dict[str, Any] = {}

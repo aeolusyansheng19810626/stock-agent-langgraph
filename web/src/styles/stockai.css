@@ -206,6 +206,13 @@ body {
 .sx-sb-header .sx-add:hover { background: var(--panel-2); color: var(--fg); }
 
 .sx-watchlist { overflow-y: auto; padding: 0 6px 8px; }
+.sx-watchlist-add { padding: 4px 6px 2px; }
+.sx-watchlist-input {
+  width: 100%; box-sizing: border-box;
+  background: var(--panel-2); border: 1px solid var(--accent);
+  border-radius: 4px; color: var(--fg); font-size: 12px;
+  padding: 5px 8px; outline: none;
+}
 .sx-watch-item {
   display: grid;
   grid-template-columns: 1fr auto;
