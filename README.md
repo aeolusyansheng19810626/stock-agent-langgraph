@@ -62,6 +62,7 @@ stock-agent-langgraph/
 │   ├── routes/
 │   │   ├── analyze.py           # POST /api/analyze（SSE 流，包 graph.stream）
 │   │   ├── _analyze_graph.py    # graph→SSE 事件分发逻辑
+│   │   ├── copilotkit.py        # CopilotKit 副驾驶端点（/api/copilotkit）
 │   │   ├── docs.py              # PDF 上传 / 列表 / 删除
 │   │   ├── quote.py             # yfinance 批量行情
 │   │   ├── history.py           # 历史记录 read / clear
@@ -80,7 +81,8 @@ stock-agent-langgraph/
 │   │   ├── context/             # QuoteCard / NewsList / FilingsList
 │   │   ├── icons/Icon.tsx       # 16 个内联 SVG
 │   │   ├── api/                 # client.ts（fetch wrapper）+ sse.ts（fetch-event-source）
-│   │   ├── store/               # zustand: chat / settings / docs / watchlist
+│   │   ├── store/               # zustand: chat / settings / docs / watchlist / ui
+│   │   ├── copilot/             # CopilotKit: actions.tsx / readables.tsx
 │   │   └── types/sse.ts         # SSE 事件 TS 镜像
 │   ├── vite.config.ts           # /api 与 /charts 反向代理到 :8000
 │   └── package.json
@@ -178,9 +180,9 @@ GEMINI_PRO   = "google/gemini-3.1-pro-preview"  # 质量优先节点
 
 | 节点 | 主力模型 | Groq Fallback |
 |------|----------|---------------|
-| data_node / news_node / rag_node / scoring_node / deep_read S1 | Gemini **Flash** | TIER_LOW / QUALITY_CASCADE |
-| parse_node / risk_node / comparison_node / hypothesis_node / deep_read S2 / reflection_node | Gemini **Pro** | QUALITY_CASCADE / 专属 CASCADE |
-| report_node | Gemini **Pro**（流式，支持多模态） | call_groq()（含图片降级） |
+| 全部分析节点（data / news / rag / scoring / parse / risk / comparison / hypothesis / reflection / deep_read） | Gemini **Flash** | QUALITY_CASCADE / 专属 CASCADE |
+| report_node | Gemini **Flash**（流式，支持多模态） | call_groq()（含图片降级） |
+| 副驾驶 chatbot | Groq **TIER_LOW**（llama-4-scout-17b） | — |
 
 ### Fallback：Groq（Gemini 异常时自动切换）
 
@@ -242,6 +244,47 @@ fetch /api/analyze (POST + body)  →   set_streaming_cb(emit)         →    _r
 
 ---
 
+## 副驾驶（CopilotKit）
+
+右侧面板第四个 tab「副驾驶」基于 **CopilotKit v1.60** 构建，是叠加在主分析流程上的 UI 操作层。
+
+### 能力
+
+| 能力 | 说明 |
+|------|------|
+| `useCopilotAction` | 注册 5 个前端 action，LLM 通过 tool calling 直接操作 React 状态 |
+| `useCopilotReadable` | 将主题/自选股/文档列表/最新报告摘要注入 LLM 上下文 |
+| `CopilotChat` | 右侧面板独立对话框，独立于主分析 SSE 流 |
+
+### 支持的 Actions
+
+| Action | 效果 |
+|--------|------|
+| `setTheme` | 切换界面主题（amber / cyan / ink） |
+| `addToWatchlist` | 将指定 ticker 加入自选股 |
+| `removeFromWatchlist` | 从自选股删除 |
+| `switchContextTab` | 切换右侧面板 tab（行情/资讯/公告/副驾驶） |
+| `setDevMode` | 开启/关闭开发模式（跳过 Gemini，仅用 Groq） |
+
+### 示例指令
+
+```
+切换到 cyan 主题
+帮我把 NVDA 和 AAPL 加进自选股
+切到行情 tab
+```
+
+### 架构说明
+
+- 后端：`server/routes/copilotkit.py`，LangGraph `StateGraph(CopilotKitState)` + `MemorySaver`
+- LLM：Groq `llama-4-scout-17b`（轻量任务，无 Gemini thinking 兼容问题）
+- 路由端点：`POST /api/copilotkit`，自定义 body-method dispatch（兼容 CopilotKit v1.60 单端点协议）
+- **不替代**主分析流程，深度股票分析仍走主输入框 → SSE pipeline
+
+> **注意**：Gemini 3 系列模型在 Vertex AI OpenAI 兼容端点上的 tool calling 强制要求 `thought_signature` 回传，而 `ag_ui_langgraph` 不处理此字段，故副驾驶 LLM 固定使用 Groq 以避免 400 错误。
+
+---
+
 ## 工具说明
 
 | 工具 | 数据源 | 说明 |
@@ -256,9 +299,10 @@ fetch /api/analyze (POST + body)  →   set_streaming_cb(emit)         →    _r
 
 ## UI 行为
 
-- **三栏布局**：左 240px 自选股 + PDF 文档；中央对话 + 报告卡；右 360px 上下文栏（行情/资讯/公告 三 tab）
+- **三栏布局**：左 240px 自选股 + PDF 文档；中央对话 + 报告卡；右 360px 上下文栏（行情/资讯/公告/副驾驶 四 tab）
 - **三套主题**：琥珀（默认）/ 电光青 / 墨绿，通过 CSS 变量切换，零重渲
 - **涨跌色翻转**：设置抽屉「红涨绿跌」开关一键切换 A 股 / 美股惯例
+- **自选股管理**：内联输入框添加（支持 `^N225` 等指数 ticker 自动补全）；条目悬停显示 × 删除
 - **流式渲染**：步骤卡片随 SSE `tool.call` 事件实时追加；报告 token 实时累积；`node.complete` 带结构化 payload 时渐进出 KPI / 估值卡
 - **重试徽章**：工具调用瞬态错误后自动重试，步骤卡片显示 `⟳ N/3`
 - **设置抽辑**：右上角齿轮按钮打开（220ms 三次贝塞尔滑入），含开发模式 / 引用必标注 / 红涨绿跌 / 自动邮件 / 数据源开关
