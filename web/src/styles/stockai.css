@@ -29,7 +29,7 @@ body {
   --radius-lg: 10px;
   --font-ui: "Inter", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "SF Pro Text", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, "PingFang SC", monospace;
-  --font-serif: "Instrument Serif", "Source Han Serif SC", "Songti SC", "Source Serif Pro", Georgia, serif;
+  --font-serif: "Noto Serif SC", "Instrument Serif", "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "Source Serif Pro", Georgia, serif;
   position: absolute; inset: 0;
   background: var(--bg); color: var(--fg);
   font-family: var(--font-ui);
