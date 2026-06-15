@@ -119,16 +119,15 @@ async def copilotkit_info_slash(request: Request):
 
 def _build_graph():
     from langchain_core.messages import SystemMessage
-    from langchain_google_genai import ChatGoogleGenerativeAI
     from langgraph.graph import StateGraph
     from copilotkit import CopilotKitState
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
-        google_api_key=os.getenv("GEMINI_API_KEY"),
-    )
-
     async def chatbot(state: CopilotKitState) -> dict:
+        # Lazy init so the key is read at request time, not at app startup.
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
+
         ck = state.get("copilotkit") or {}
         frontend_actions = ck.get("actions") or []
 
